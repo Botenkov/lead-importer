@@ -369,13 +369,13 @@ def run():
     tabs = [
         {
             "name":        "Kitchen New",
-            "range":       "Kitchen New!A2:R500",
+            "range":       "A2:R500",
             "status_col":  18,  # Колонка R (1-indexed для gspread)
             "processor":   process_kitchen_row,
         },
         {
             "name":        "Ormari",
-            "range":       "Ormari!A2:S500",
+            "range":       "A2:S500",
             "status_col":  19,  # Колонка S (1-indexed для gspread)
             "processor":   process_ormari_row,
         },
