@@ -67,7 +67,9 @@ def get_gspread_client():
             "Переменная окружения GOOGLE_CREDENTIALS_JSON не задана. "
             "Добавь её в Railway → Variables."
         )
-    creds_dict = json.loads(creds_json)
+    # Убираем переносы строк — Railway иногда сохраняет переменную в многострочном формате
+    creds_json_clean = creds_json.strip().replace("\r\n", "").replace("\r", "")
+    creds_dict = json.loads(creds_json_clean)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
