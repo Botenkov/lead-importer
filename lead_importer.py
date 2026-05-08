@@ -9,9 +9,13 @@ lead_importer.py
   DUPLICATE — уже существует в Bitrix24
   ERROR: …  — что-то пошло не так (текст ошибки)
 
+После создания лида — назначает оператора в ChatApp по маппингу Bitrix ID.
+
 Переменные окружения (Railway / .env):
   GOOGLE_CREDENTIALS_JSON  — JSON сервисного аккаунта Google (одной строкой)
   BITRIX_WEBHOOK           — URL вебхука Bitrix24
+  CHATAPP_EMAIL            — email от кабинета ChatApp
+  CHATAPP_PASSWORD         — пароль от кабинета ChatApp
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -53,6 +57,98 @@ SOURCE_MAP = {
 }
 
 LEAD_STATUS_ID = "UC_6TAZVN"
+
+# ─── ChatApp конфигурация ────────────────────────────────────────────────────
+
+CHATAPP_EMAIL      = os.environ.get("CHATAPP_EMAIL", "project@teksturaburo.com")
+CHATAPP_PASSWORD   = os.environ.get("CHATAPP_PASSWORD", "3A8CMJU5Jmx!PPd")
+CHATAPP_APP_ID     = "app_92851_1"
+CHATAPP_LICENSE_ID = 76410
+CHATAPP_MESSENGER  = "grWhatsApp"
+CHATAPP_API        = "https://api.chatapp.online/v1"
+
+# Маппинг: Bitrix ASSIGNED_BY_ID → ChatApp operator ID
+# Dmitry Botenkov (ID 1) исключён
+CHATAPP_OPERATOR_MAP = {
+    28: 94104,  # Djordje Tomic
+    30: 93980,  # Dmitrii Piskun
+}
+
+# Кэш токена — получаем один раз за запуск
+_chatapp_token: str | None = None
+
+
+def get_chatapp_token() -> str | None:
+    """
+    Получает accessToken от ChatApp API.
+    Кэширует на время работы скрипта.
+    """
+    global _chatapp_token
+    if _chatapp_token:
+        return _chatapp_token
+    try:
+        r = requests.post(
+            f"{CHATAPP_API}/tokens",
+            json={
+                "email":    CHATAPP_EMAIL,
+                "password": CHATAPP_PASSWORD,
+                "appId":    CHATAPP_APP_ID,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        token = r.json().get("data", {}).get("accessToken")
+        if token:
+            _chatapp_token = token
+            log.info("ChatApp: accessToken получен успешно")
+        else:
+            log.warning(f"ChatApp: accessToken не найден в ответе: {r.json()}")
+        return _chatapp_token
+    except Exception as e:
+        log.warning(f"ChatApp: ошибка получения токена: {e}")
+        return None
+
+
+def assign_chatapp_operator(phone: str, bitrix_assigned_id: int) -> bool:
+    """
+    Назначает оператора в ChatApp для чата по номеру телефона.
+    Возвращает True при успехе, False при ошибке.
+    """
+    operator_id = CHATAPP_OPERATOR_MAP.get(bitrix_assigned_id)
+    if not operator_id:
+        log.info(f"ChatApp: нет маппинга для Bitrix ID={bitrix_assigned_id}, пропускаем")
+        return False
+
+    if not phone:
+        log.info("ChatApp: телефон не указан, пропускаем назначение оператора")
+        return False
+
+    token = get_chatapp_token()
+    if not token:
+        return False
+
+    # chatId = номер телефона (только цифры)
+    chat_id = re.sub(r"\D", "", phone)
+
+    try:
+        r = requests.put(
+            f"{CHATAPP_API}/licenses/{CHATAPP_LICENSE_ID}"
+            f"/messengers/{CHATAPP_MESSENGER}"
+            f"/chats/{chat_id}/operator",
+            headers={"Authorization": token},
+            json={"operatorId": operator_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        log.info(
+            f"ChatApp: оператор {operator_id} назначен для чата {chat_id} "
+            f"(Bitrix ID={bitrix_assigned_id})"
+        )
+        return True
+    except Exception as e:
+        log.warning(f"ChatApp: ошибка назначения оператора для {chat_id}: {e}")
+        return False
+
 
 # ─── Google Sheets: авторизация ─────────────────────────────────────────────
 
@@ -124,9 +220,10 @@ def find_lead_by_phone(phone: str) -> bool:
 def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment, assigned_by_id):
     """
     Создаёт контакт + лид в Bitrix24, связывает их и добавляет Viber-ссылку.
+    После создания — назначает оператора в ChatApp.
     Возвращает lead_id или бросает исключение при ошибке.
 
-    Порядок строго по инструкции: A → B → C → D.
+    Порядок: A → B → C → D → E
     """
 
     # A: создаём контакт
@@ -175,6 +272,10 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
             "fields": {"UF_CRM_VIBER_LINK": f"viber://chat?number={phone}"},
         })
         time.sleep(BITRIX_DELAY)
+
+    # E: назначаем оператора в ChatApp
+    if phone:
+        assign_chatapp_operator(phone, assigned_by_id)
 
     return lead_id
 
@@ -246,17 +347,17 @@ def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -
     if status_val:
         return "SKIP"  # уже обработана
 
-    email    = row[14].strip()
-    raw_name = row[15].strip()
+    email     = row[14].strip()
+    raw_name  = row[15].strip()
     raw_phone = row[16].strip()
-    platform = row[11].strip()
+    platform  = row[11].strip()
 
     # Данные для комментария
-    ad      = row[3].strip()
-    adset   = row[5].strip()
-    size    = row[12].strip()
+    ad       = row[3].strip()
+    adset    = row[5].strip()
+    size     = row[12].strip()
     timeline = row[13].strip()
-    date    = row[1].strip()
+    date     = row[1].strip()
 
     phone = parse_phone(raw_phone)
 
@@ -351,10 +452,14 @@ def run():
     log.info("=" * 60)
     log.info("Запуск импорта лидов")
 
+    # Прогреваем ChatApp токен заранее
+    get_chatapp_token()
+
     # Определяем ответственного
     assigned_by_id = get_assigned_by_id()
     weekday_name = datetime.now(timezone.utc).strftime("%A")
     log.info(f"День: {weekday_name}, ASSIGNED_BY_ID={assigned_by_id}")
+    log.info(f"ChatApp operator: {CHATAPP_OPERATOR_MAP.get(assigned_by_id, 'нет маппинга')}")
 
     # Подключаемся к Google Sheets
     gc = get_gspread_client()
@@ -430,10 +535,10 @@ def run():
 
     # ── Итоговый отчёт ───────────────────────────────────────────────────
     log.info("\n" + "=" * 60)
-    log.info(f"ИТОГ:")
-    log.info(f"  Создано лидов:   {total_created}")
+    log.info("ИТОГ:")
+    log.info(f"  Создано лидов:    {total_created}")
     log.info(f"  Дублей пропущено: {total_duplicate}")
-    log.info(f"  Ошибок:          {total_error}")
+    log.info(f"  Ошибок:           {total_error}")
     log.info("=" * 60)
 
 
