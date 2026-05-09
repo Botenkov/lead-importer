@@ -218,27 +218,30 @@ def is_duplicate(email: str, phone: str) -> bool:
     Поиск дублей через crm.duplicate.findbycomm — это родной метод Bitrix24
     для поиска по средствам связи. Возвращает точные совпадения.
 
-    Структура ответа: {"result": {"LEAD": [id1, id2], "CONTACT": [...]}}
+    Структура ответа Bitrix24 непоследовательная:
+      Дубли есть: {"result": {"LEAD": [id1, id2]}}    ← dict
+      Дублей нет: {"result": []}                       ← list (sic!)
+    Поэтому проверяем isinstance перед .get()
     """
-    if email:
+    def _check(comm_type: str, value: str) -> bool:
         r = bitrix_call("crm.duplicate.findbycomm", {
-            "type":        "EMAIL",
-            "values":      [email],
+            "type":        comm_type,
+            "values":      [value],
             "entity_type": "LEAD",
         })
-        if r.get("result", {}).get("LEAD"):
-            log.info(f"  Дубль по EMAIL ({email}): {r['result']['LEAD']}")
+        result = r.get("result")
+        if isinstance(result, dict) and result.get("LEAD"):
+            log.info(f"  Дубль по {comm_type} ({value}): {result['LEAD']}")
+            return True
+        return False
+
+    if email:
+        if _check("EMAIL", email):
             return True
         time.sleep(BITRIX_DELAY)
 
     if phone:
-        r = bitrix_call("crm.duplicate.findbycomm", {
-            "type":        "PHONE",
-            "values":      [phone],
-            "entity_type": "LEAD",
-        })
-        if r.get("result", {}).get("LEAD"):
-            log.info(f"  Дубль по PHONE ({phone}): {r['result']['LEAD']}")
+        if _check("PHONE", phone):
             return True
         time.sleep(BITRIX_DELAY)
 
