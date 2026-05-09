@@ -5,7 +5,7 @@ lead_importer.py
 
 Читает вкладки "Kitchen New" и "Ormari", проверяет дубли через Bitrix24 API,
 создаёт новые лиды и отмечает каждую строку в таблице:
-  CREATED   — лид успешно создан
+  CREATED   — лид успешно создан И ВЕРИФИЦИРОВАН в Bitrix24
   DUPLICATE — уже существует в Bitrix24
   ERROR: …  — что-то пошло не так (текст ошибки)
 
@@ -48,7 +48,7 @@ BITRIX_WEBHOOK  = os.environ.get(
 )
 
 # Пауза между запросами к Bitrix24 — чтобы не словить rate limit
-BITRIX_DELAY = 0.3  # секунды
+BITRIX_DELAY = 0.4  # секунды
 
 # SOURCE_ID по платформе
 SOURCE_MAP = {
@@ -113,6 +113,7 @@ def assign_chatapp_operator(phone: str, bitrix_assigned_id: int) -> bool:
     """
     Назначает оператора в ChatApp для чата по номеру телефона.
     Возвращает True при успехе, False при ошибке.
+    Никогда не выбрасывает исключение — поломка ChatApp не должна валить импорт лидов.
     """
     operator_id = CHATAPP_OPERATOR_MAP.get(bitrix_assigned_id)
     if not operator_id:
@@ -180,6 +181,11 @@ def bitrix_call(method: str, params: dict) -> dict:
     """
     Делает POST-запрос к Bitrix24 REST API.
     Параметры передаются как form-encoded (Bitrix24 так ожидает вложенные поля).
+
+    КРИТИЧНО: Bitrix24 при логических ошибках (rate limit, auth, невалидный фильтр)
+    возвращает HTTP 200 + JSON {"error": "...", "error_description": "..."}.
+    Эта функция теперь ВСЕГДА raise при наличии error в ответе — иначе
+    скрипт думает что всё ок и пишет CREATED без реального создания лида.
     """
     flat = {}
 
@@ -196,37 +202,80 @@ def bitrix_call(method: str, params: dict) -> dict:
     flatten(params)
     response = requests.post(BITRIX_WEBHOOK + method, data=flat, timeout=15)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+
+    # Bitrix может вернуть ошибку в JSON при HTTP 200 — обрабатываем явно
+    if isinstance(data, dict) and data.get("error"):
+        err_code = data.get("error", "")
+        err_desc = data.get("error_description", "")
+        raise RuntimeError(f"Bitrix API '{method}' error: {err_code} — {err_desc}")
+
+    return data
 
 
-def find_lead_by_email(email: str) -> bool:
-    """Возвращает True, если в Bitrix24 уже есть лид с таким email."""
-    if not email:
+def is_duplicate(email: str, phone: str) -> bool:
+    """
+    Поиск дублей через crm.duplicate.findbycomm — это родной метод Bitrix24
+    для поиска по средствам связи. Возвращает точные совпадения.
+
+    Структура ответа: {"result": {"LEAD": [id1, id2], "CONTACT": [...]}}
+    """
+    if email:
+        r = bitrix_call("crm.duplicate.findbycomm", {
+            "type":        "EMAIL",
+            "values":      [email],
+            "entity_type": "LEAD",
+        })
+        if r.get("result", {}).get("LEAD"):
+            log.info(f"  Дубль по EMAIL ({email}): {r['result']['LEAD']}")
+            return True
+        time.sleep(BITRIX_DELAY)
+
+    if phone:
+        r = bitrix_call("crm.duplicate.findbycomm", {
+            "type":        "PHONE",
+            "values":      [phone],
+            "entity_type": "LEAD",
+        })
+        if r.get("result", {}).get("LEAD"):
+            log.info(f"  Дубль по PHONE ({phone}): {r['result']['LEAD']}")
+            return True
+        time.sleep(BITRIX_DELAY)
+
+    return False
+
+
+def verify_lead_exists(lead_id) -> bool:
+    """
+    Проверяет что лид реально существует в Bitrix24 после создания.
+    Защита от фантомного CREATED — если crm.lead.add вернул что-то странное,
+    crm.lead.get не найдёт лид и мы поднимем ERROR.
+    """
+    try:
+        r = bitrix_call("crm.lead.get", {"id": lead_id})
+        result = r.get("result")
+        if not result or str(result.get("ID")) != str(lead_id):
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"  verify_lead_exists({lead_id}) упал: {e}")
         return False
-    result = bitrix_call("crm.lead.list", {"filter": {"EMAIL": email}, "select": ["ID"]})
-    time.sleep(BITRIX_DELAY)
-    return result.get("total", 0) > 0
-
-
-def find_lead_by_phone(phone: str) -> bool:
-    """Возвращает True, если в Bitrix24 уже есть лид с таким телефоном."""
-    if not phone:
-        return False
-    result = bitrix_call("crm.lead.list", {"filter": {"PHONE": phone}, "select": ["ID"]})
-    time.sleep(BITRIX_DELAY)
-    return result.get("total", 0) > 0
 
 
 def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment, assigned_by_id):
     """
-    Создаёт контакт + лид в Bitrix24, связывает их и добавляет Viber-ссылку.
+    Создаёт контакт + лид в Bitrix24, добавляет Viber-ссылку и верифицирует.
     После создания — назначает оператора в ChatApp.
     Возвращает lead_id или бросает исключение при ошибке.
 
-    Порядок: A → B → C → D → E
+    Порядок:
+      A. crm.contact.add → contact_id
+      B. crm.lead.add (с CONTACT_IDS и Viber сразу) → lead_id
+      C. crm.lead.get → верификация что лид реально создан
+      D. ChatApp оператор (не блокирующий)
     """
 
-    # A: создаём контакт
+    # ── A. Создаём контакт ──────────────────────────────────────────────────
     contact_fields = {"NAME": name, "LAST_NAME": last_name}
     if email:
         contact_fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
@@ -235,11 +284,14 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
 
     r_contact = bitrix_call("crm.contact.add", {"fields": contact_fields})
     contact_id = r_contact.get("result")
-    if not contact_id:
-        raise RuntimeError(f"crm.contact.add вернул пустой result: {r_contact}")
+    if not contact_id or not isinstance(contact_id, int):
+        raise RuntimeError(
+            f"crm.contact.add не вернул валидный ID. Ответ: {r_contact}"
+        )
+    log.info(f"  Контакт создан: ID={contact_id}")
     time.sleep(BITRIX_DELAY)
 
-    # B: создаём лид
+    # ── B. Создаём лид (с привязкой к контакту и Viber-ссылкой сразу) ──────
     lead_fields = {
         "TITLE":          title,
         "NAME":           name,
@@ -248,32 +300,34 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
         "STATUS_ID":      LEAD_STATUS_ID,
         "ASSIGNED_BY_ID": assigned_by_id,
         "COMMENTS":       comment,
+        "CONTACT_IDS":    [contact_id],
     }
     if email:
         lead_fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
     if phone:
-        lead_fields["PHONE"] = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
-        lead_fields["IM"]    = [{"VALUE_TYPE": "VIBER", "VALUE": phone}]
+        lead_fields["PHONE"]              = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
+        lead_fields["IM"]                 = [{"VALUE_TYPE": "VIBER", "VALUE": phone}]
+        lead_fields["UF_CRM_VIBER_LINK"]  = f"viber://chat?number={phone}"
 
     r_lead = bitrix_call("crm.lead.add", {"fields": lead_fields})
     lead_id = r_lead.get("result")
-    if not lead_id:
-        raise RuntimeError(f"crm.lead.add вернул пустой result: {r_lead}")
+    if not lead_id or not isinstance(lead_id, int):
+        raise RuntimeError(
+            f"crm.lead.add не вернул валидный ID. Ответ: {r_lead}"
+        )
+    log.info(f"  Лид создан: ID={lead_id}")
     time.sleep(BITRIX_DELAY)
 
-    # C: привязываем контакт к лиду (обязательно отдельным вызовом!)
-    bitrix_call("crm.lead.update", {"id": lead_id, "fields": {"CONTACT_ID": contact_id}})
+    # ── C. ВЕРИФИКАЦИЯ: лид реально существует? ────────────────────────────
+    if not verify_lead_exists(lead_id):
+        raise RuntimeError(
+            f"crm.lead.add вернул ID={lead_id}, но crm.lead.get не подтверждает "
+            f"существование. Контакт {contact_id} остался осиротевшим."
+        )
+    log.info(f"  Лид {lead_id} верифицирован ✓")
     time.sleep(BITRIX_DELAY)
 
-    # D: добавляем Viber-ссылку
-    if phone:
-        bitrix_call("crm.lead.update", {
-            "id":     lead_id,
-            "fields": {"UF_CRM_VIBER_LINK": f"viber://chat?number={phone}"},
-        })
-        time.sleep(BITRIX_DELAY)
-
-    # E: назначаем оператора в ChatApp
+    # ── D. ChatApp (не блокирует, ошибки только логируем) ──────────────────
     if phone:
         assign_chatapp_operator(phone, assigned_by_id)
 
@@ -361,10 +415,8 @@ def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -
 
     phone = parse_phone(raw_phone)
 
-    # Дедупликация
-    if find_lead_by_email(email):
-        return "DUPLICATE"
-    if phone and find_lead_by_phone(phone):
+    # Дедупликация (через crm.duplicate.findbycomm — единственный надёжный способ)
+    if is_duplicate(email, phone):
         return "DUPLICATE"
 
     # Парсинг имени
@@ -382,8 +434,9 @@ def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -
         f"Timeline: {timeline} | Adset: {adset} | Date: {date}"
     )
 
+    log.info(f"  → Создаю Kitchen лид: {title}")
     lead_id = create_bitrix_lead(title, name, last_name, phone, email, src_id, comment, assigned_by_id)
-    log.info(f"  Kitchen New → лид создан ID={lead_id}: {title}")
+    log.info(f"  ✓ Kitchen New → лид создан ID={lead_id}: {title}")
     return "CREATED"
 
 
@@ -421,9 +474,7 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
     phone = parse_phone(raw_phone)
 
     # Дедупликация
-    if find_lead_by_email(email):
-        return "DUPLICATE"
-    if phone and find_lead_by_phone(phone):
+    if is_duplicate(email, phone):
         return "DUPLICATE"
 
     # Парсинг имени
@@ -441,8 +492,9 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
         f"Timeline: {timeline} | Adset: {adset} | Date: {date}"
     )
 
+    log.info(f"  → Создаю Ormari лид: {title}")
     lead_id = create_bitrix_lead(title, name, last_name, phone, email, src_id, comment, assigned_by_id)
-    log.info(f"  Ormari → лид создан ID={lead_id}: {title}")
+    log.info(f"  ✓ Ormari → лид создан ID={lead_id}: {title}")
     return "CREATED"
 
 
