@@ -189,7 +189,7 @@ TABS = [
         "date_col_idx":    1,    # B
     },
     {
-        "name":            "Kitchen май",
+        "name":            "kitchen Май",
         "range":           "A2:T",
         "status_col_idx":  19,   # T (0-based) — статус
         "email_col_idx":   16,   # Q
