@@ -3,7 +3,7 @@
 reconcile.py — ежедневная сверка Google Sheets ↔ Bitrix24.
 
 Что делает:
-  1. Читает обе вкладки (Kitchen New, Ormari)
+  1. Читает все вкладки (Kitchen New, Ormari, Kitchen май)
   2. Для каждой строки со статусом CREATED за последние N дней
      проверяет — действительно ли лид существует в Bitrix24
   3. Если фантом (CREATED в таблице, нет в Bitrix) → очищает статус.
@@ -186,6 +186,14 @@ TABS = [
         "status_col_idx":  18,   # S
         "email_col_idx":   15,   # P
         "phone_col_idx":   17,   # R
+        "date_col_idx":    1,    # B
+    },
+    {
+        "name":            "Kitchen май",
+        "range":           "A2:T",
+        "status_col_idx":  19,   # T (0-based) — статус
+        "email_col_idx":   16,   # Q
+        "phone_col_idx":   18,   # S
         "date_col_idx":    1,    # B
     },
 ]
