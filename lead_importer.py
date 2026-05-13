@@ -502,7 +502,7 @@ def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: in
         else f"{name} — Kitchen ({plat_label})"
     )
     comment = (
-        f"Tab: Kitchen май | Ad: {ad} | Plan: {has_plan} | Timeline: {timeline} | "
+        f"Tab: kitchen Май | Ad: {ad} | Plan: {has_plan} | Timeline: {timeline} | "
         f"Budget: {budget_raw} | Tehnika: {tehnika_raw} | Adset: {adset} | Date: {date}"
     )
 
@@ -516,12 +516,12 @@ def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: in
     if tehnika_value is not None:
         extra_fields[UF_TEHNIKA] = tehnika_value
 
-    log.info(f"  → Создаю Kitchen май лид: {title} | budget={budget_value} tehnika={tehnika_value}")
+    log.info(f"  → Создаю kitchen Май лид: {title} | budget={budget_value} tehnika={tehnika_value}")
     lead_id = create_bitrix_lead(
         title, name, last_name, phone, email, src_id, comment, assigned_by_id,
         extra_fields=extra_fields,
     )
-    log.info(f"  ✓ Kitchen май → лид создан ID={lead_id}: {title}")
+    log.info(f"  ✓ kitchen Май → лид создан ID={lead_id}: {title}")
     return "CREATED"
 
 
@@ -560,7 +560,7 @@ def run():
             "processor":   process_ormari_row,
         },
         {
-            "name":        "Kitchen май",
+            "name":        "kitchen Май",
             "range":       "A2:T500",
             "status_col":  20,  # Колонка T (1-indexed для gspread)
             "processor":   process_kitchen_may_row,
