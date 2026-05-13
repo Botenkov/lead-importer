@@ -227,6 +227,8 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
         contact_fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
     if phone:
         contact_fields["PHONE"] = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
+        # IM (Viber) — для синхронности с лидом
+        contact_fields["IM"]    = [{"VALUE": phone, "VALUE_TYPE": "VIBER"}]
 
     r_contact = bitrix_call("crm.contact.add", {"fields": contact_fields})
     contact_id = r_contact.get("result")
