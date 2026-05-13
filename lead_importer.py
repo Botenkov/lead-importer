@@ -56,6 +56,36 @@ SOURCE_MAP = {
 
 LEAD_STATUS_ID = "UC_6TAZVN"
 
+
+# ─── Формат статуса в Google Sheets ─────────────────────────────────────────
+# Lead-importer пишет в колонку статуса один из форматов:
+#   CREATED:1234         — лид успешно создан с ID 1234
+#   DUPLICATE            — уже есть в Bitrix
+#   ERROR: ...           — ошибка
+#
+# Раньше писали просто "CREATED", но это уязвимо: любой посторонний
+# процесс может поставить "CREATED" в момент появления строки, и
+# lead-importer пропустит её как обработанную, лид не попадёт в Bitrix.
+#
+# Теперь: если статус НЕ соответствует нашему формату — не доверяем,
+# обрабатываем как новую строку. is_duplicate отловит реальные дубли.
+
+CREATED_WITH_ID = re.compile(r"^CREATED:\d+$")
+
+def is_our_processed_status(status_val: str) -> bool:
+    """Возвращает True если статус — наша запись (значит SKIP).
+    Просто 'CREATED' без ID считаем подозрительным и переобрабатываем."""
+    s = (status_val or "").strip()
+    if not s:
+        return False
+    if CREATED_WITH_ID.match(s):       # CREATED:1234
+        return True
+    if s == "DUPLICATE":
+        return True
+    if s.startswith("ERROR:") or s.startswith("ERROR "):
+        return True
+    return False
+
 # ─── Маппинги для Kitchen май ───────────────────────────────────────────────
 # Поля новой формы (Kitchen 2.0): бюджет + флаг "нужна техника"
 
@@ -222,7 +252,14 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
     """
 
     # ── A. Создаём контакт ──────────────────────────────────────────────────
-    contact_fields = {"NAME": name, "LAST_NAME": last_name}
+    # ASSIGNED_BY_ID обязательно: иначе Bitrix дефолтит на создателя webhook'а (user 1),
+    # и контакт получает ответственного отличного от лида — рассинхрон.
+    contact_fields = {
+        "NAME":           name,
+        "LAST_NAME":      last_name,
+        "ASSIGNED_BY_ID": assigned_by_id,
+        "OPENED":         "Y",
+    }
     if email:
         contact_fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
     if phone:
@@ -348,8 +385,8 @@ def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -
         row.append("")
 
     status_val = row[17].strip()
-    if status_val:
-        return "SKIP"  # уже обработана
+    if is_our_processed_status(status_val):
+        return "SKIP"  # уже обработана нашим скриптом
 
     email     = row[14].strip()
     raw_name  = row[15].strip()
@@ -387,7 +424,7 @@ def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -
     log.info(f"  → Создаю Kitchen лид: {title}")
     lead_id = create_bitrix_lead(title, name, last_name, phone, email, src_id, comment, assigned_by_id)
     log.info(f"  ✓ Kitchen New → лид создан ID={lead_id}: {title}")
-    return "CREATED"
+    return f"CREATED:{lead_id}"
 
 
 # ─── Обработка вкладки Ormari ───────────────────────────────────────────────
@@ -405,8 +442,8 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
         row.append("")
 
     status_val = row[18].strip()
-    if status_val:
-        return "SKIP"  # уже обработана
+    if is_our_processed_status(status_val):
+        return "SKIP"  # уже обработана нашим скриптом
 
     email     = row[15].strip()
     raw_name  = row[16].strip()
@@ -445,7 +482,7 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
     log.info(f"  → Создаю Ormari лид: {title}")
     lead_id = create_bitrix_lead(title, name, last_name, phone, email, src_id, comment, assigned_by_id)
     log.info(f"  ✓ Ormari → лид создан ID={lead_id}: {title}")
-    return "CREATED"
+    return f"CREATED:{lead_id}"
 
 
 # ─── Обработка вкладки Kitchen май ─────────────────────────────────────────
@@ -470,8 +507,8 @@ def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: in
         row.append("")
 
     status_val = row[19].strip()
-    if status_val:
-        return "SKIP"  # уже обработана
+    if is_our_processed_status(status_val):
+        return "SKIP"  # уже обработана нашим скриптом
 
     email     = row[16].strip()
     raw_name  = row[17].strip()
@@ -524,7 +561,7 @@ def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: in
         extra_fields=extra_fields,
     )
     log.info(f"  ✓ kitchen Май → лид создан ID={lead_id}: {title}")
-    return "CREATED"
+    return f"CREATED:{lead_id}"
 
 
 # ─── Главная функция ─────────────────────────────────────────────────────────
@@ -604,7 +641,7 @@ def run():
                 # Записываем статус в таблицу
                 sheet.update_cell(sheet_row, status_col, status)
 
-                if status == "CREATED":
+                if status == "CREATED" or status.startswith("CREATED:"):
                     total_created += 1
                 elif status == "DUPLICATE":
                     total_duplicate += 1
