@@ -130,6 +130,33 @@ def lead_exists_in_bitrix(email: str, phone: str) -> bool:
     return False
 
 
+def lead_exists_by_id(lead_id: int) -> bool:
+    """
+    Прямая проверка существования лида по ID через crm.lead.get.
+    Используется для формата статуса CREATED:NNN.
+    Это надёжнее чем поиск по email — отлавливает фантомы, где
+    Bitrix вернул ID, но лид потом был удалён / откачен.
+    """
+    try:
+        r = bitrix_call("crm.lead.get", {"id": lead_id})
+        result = r.get("result")
+        if not result:
+            return False
+        # Проверяем что вернулся именно тот лид
+        if str(result.get("ID")) != str(lead_id):
+            return False
+        return True
+    except RuntimeError as e:
+        # Если Bitrix вернул ошибку "Not found" — лид удалён
+        if "not found" in str(e).lower() or "not_found" in str(e).lower():
+            return False
+        # Прочие ошибки (5xx) — НЕ считаем фантомом, не трогаем строку
+        log.warning(f"  lead_exists_by_id({lead_id}) упал: {e}")
+        return True  # консервативно: НЕ трогаем при неясности
+    finally:
+        time.sleep(BITRIX_DELAY)
+
+
 # ─── Парсинг ────────────────────────────────────────────────────────────────
 def parse_phone(raw: str) -> str:
     """Удаляет префикс 'p:' и обрезает пробелы."""
@@ -239,10 +266,23 @@ def main() -> int:
         for i, row in enumerate(rows):
             sheet_row = i + 2  # данные с строки 2
 
-            # Только строки со статусом CREATED
+            # Берём статус. Понимаем два формата:
+            #   CREATED       — старый/посторонний, проверяем через duplicate.findbycomm
+            #   CREATED:1234  — наш с ID, проверяем напрямую crm.lead.get(1234)
+            # DUPLICATE / ERROR / прочее — не трогаем
             status = row[cfg["status_col_idx"]] if len(row) > cfg["status_col_idx"] else ""
-            if status != "CREATED":
-                continue
+            status = status.strip()
+
+            lead_id_from_status = None
+            if status == "CREATED":
+                pass  # будем проверять по email/phone
+            elif status.startswith("CREATED:"):
+                try:
+                    lead_id_from_status = int(status.split(":", 1)[1])
+                except (ValueError, IndexError):
+                    continue  # битый формат, не трогаем
+            else:
+                continue  # DUPLICATE, ERROR, пусто — пропускаем
 
             # Только строки в окне LOOKBACK_DAYS
             date_raw = row[cfg["date_col_idx"]] if len(row) > cfg["date_col_idx"] else ""
@@ -257,7 +297,12 @@ def main() -> int:
             total_checked += 1
 
             try:
-                exists = lead_exists_in_bitrix(email, phone)
+                if lead_id_from_status is not None:
+                    # Прямая проверка по ID — самая надёжная
+                    exists = lead_exists_by_id(lead_id_from_status)
+                else:
+                    # Поиск по email/phone — для старого формата
+                    exists = lead_exists_in_bitrix(email, phone)
             except Exception as e:
                 log.error(f"  Не смог проверить row {sheet_row} ({email}): {e}")
                 continue
