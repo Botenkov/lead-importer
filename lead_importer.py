@@ -3,19 +3,17 @@ lead_importer.py
 ────────────────────────────────────────────────────────────────────────────
 Импорт лидов из Google Sheets → Bitrix24.
 
-Читает вкладки "Kitchen New" и "Ormari", проверяет дубли через Bitrix24 API,
-создаёт новые лиды и отмечает каждую строку в таблице:
+Читает вкладки "Kitchen New", "Ormari" и "Kitchen май", проверяет дубли через
+Bitrix24 API, создаёт новые лиды и отмечает каждую строку в таблице:
   CREATED   — лид успешно создан И ВЕРИФИЦИРОВАН в Bitrix24
   DUPLICATE — уже существует в Bitrix24
   ERROR: …  — что-то пошло не так (текст ошибки)
 
-После создания лида — назначает оператора в ChatApp по маппингу Bitrix ID.
+Назначение операторов в ChatApp вынесено в отдельный сервис (chat-assigner).
 
 Переменные окружения (Railway / .env):
   GOOGLE_CREDENTIALS_JSON  — JSON сервисного аккаунта Google (одной строкой)
   BITRIX_WEBHOOK           — URL вебхука Bitrix24
-  CHATAPP_EMAIL            — email от кабинета ChatApp
-  CHATAPP_PASSWORD         — пароль от кабинета ChatApp
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -58,97 +56,39 @@ SOURCE_MAP = {
 
 LEAD_STATUS_ID = "UC_6TAZVN"
 
-# ─── ChatApp конфигурация ────────────────────────────────────────────────────
+# ─── Маппинги для Kitchen май ───────────────────────────────────────────────
+# Поля новой формы (Kitchen 2.0): бюджет + флаг "нужна техника"
 
-CHATAPP_EMAIL      = os.environ.get("CHATAPP_EMAIL", "project@teksturaburo.com")
-CHATAPP_PASSWORD   = os.environ.get("CHATAPP_PASSWORD", "3A8CMJU5Jmx!PPd")
-CHATAPP_APP_ID     = "app_92851_1"
-CHATAPP_LICENSE_ID = 76410
-CHATAPP_MESSENGER  = "grWhatsApp"
-CHATAPP_API        = "https://api.chatapp.online/v1"
-
-# Маппинг: Bitrix ASSIGNED_BY_ID → ChatApp operator ID
-# Dmitry Botenkov (ID 1) исключён
-CHATAPP_OPERATOR_MAP = {
-    28: 94104,  # Djordje Tomic
-    30: 93980,  # Dmitrii Piskun
+# UF_CRM_1778484294109 (money, "число|EUR")
+# Берём верхнюю границу диапазона — так уже было у руками заведённых лидов
+BUDGET_MAP = {
+    "do_4.000€":     "4000|EUR",
+    "4.000–6.000€":  "6000|EUR",
+    "6.000–9.000€":  "9000|EUR",
+    "9.000€+":       "10000|EUR",
+    # "još_nisam_siguran" → не передаём (см. parse_budget)
 }
 
-# Кэш токена — получаем один раз за запуск
-_chatapp_token: str | None = None
+# UF_CRM_1778484348218 (boolean, "Запрос на технику")
+# Если "samo_kuhinja" — точно нет; если "kuhinja_+_tehnika" — точно да; иначе не передаём.
+TEHNIKA_MAP = {
+    "samo_kuhinja":           0,
+    "kuhinja_+_tehnika":      1,
+    # "još_nisam_siguran_/_sigurna" → None (не передаём)
+}
+
+UF_BUDGET  = "UF_CRM_1778484294109"
+UF_TEHNIKA = "UF_CRM_1778484348218"
 
 
-def get_chatapp_token() -> str | None:
-    """
-    Получает accessToken от ChatApp API.
-    Кэширует на время работы скрипта.
-    """
-    global _chatapp_token
-    if _chatapp_token:
-        return _chatapp_token
-    try:
-        r = requests.post(
-            f"{CHATAPP_API}/tokens",
-            json={
-                "email":    CHATAPP_EMAIL,
-                "password": CHATAPP_PASSWORD,
-                "appId":    CHATAPP_APP_ID,
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        token = r.json().get("data", {}).get("accessToken")
-        if token:
-            _chatapp_token = token
-            log.info("ChatApp: accessToken получен успешно")
-        else:
-            log.warning(f"ChatApp: accessToken не найден в ответе: {r.json()}")
-        return _chatapp_token
-    except Exception as e:
-        log.warning(f"ChatApp: ошибка получения токена: {e}")
-        return None
+def parse_budget(raw: str) -> str | None:
+    """Превращает 'do_4.000€' / '4.000–6.000€' / ... в '4000|EUR'. Иначе None."""
+    return BUDGET_MAP.get(raw.strip()) if raw else None
 
 
-def assign_chatapp_operator(phone: str, bitrix_assigned_id: int) -> bool:
-    """
-    Назначает оператора в ChatApp для чата по номеру телефона.
-    Возвращает True при успехе, False при ошибке.
-    Никогда не выбрасывает исключение — поломка ChatApp не должна валить импорт лидов.
-    """
-    operator_id = CHATAPP_OPERATOR_MAP.get(bitrix_assigned_id)
-    if not operator_id:
-        log.info(f"ChatApp: нет маппинга для Bitrix ID={bitrix_assigned_id}, пропускаем")
-        return False
-
-    if not phone:
-        log.info("ChatApp: телефон не указан, пропускаем назначение оператора")
-        return False
-
-    token = get_chatapp_token()
-    if not token:
-        return False
-
-    # chatId = номер телефона (только цифры)
-    chat_id = re.sub(r"\D", "", phone)
-
-    try:
-        r = requests.put(
-            f"{CHATAPP_API}/licenses/{CHATAPP_LICENSE_ID}"
-            f"/messengers/{CHATAPP_MESSENGER}"
-            f"/chats/{chat_id}/operator",
-            headers={"Authorization": token},
-            json={"operatorId": operator_id},
-            timeout=10,
-        )
-        r.raise_for_status()
-        log.info(
-            f"ChatApp: оператор {operator_id} назначен для чата {chat_id} "
-            f"(Bitrix ID={bitrix_assigned_id})"
-        )
-        return True
-    except Exception as e:
-        log.warning(f"ChatApp: ошибка назначения оператора для {chat_id}: {e}")
-        return False
+def parse_tehnika(raw: str) -> int | None:
+    """0 / 1 для известных значений, None для 'не уверен' и прочего."""
+    return TEHNIKA_MAP.get(raw.strip()) if raw else None
 
 
 # ─── Google Sheets: авторизация ─────────────────────────────────────────────
@@ -184,8 +124,8 @@ def bitrix_call(method: str, params: dict) -> dict:
 
     КРИТИЧНО: Bitrix24 при логических ошибках (rate limit, auth, невалидный фильтр)
     возвращает HTTP 200 + JSON {"error": "...", "error_description": "..."}.
-    Эта функция теперь ВСЕГДА raise при наличии error в ответе — иначе
-    скрипт думает что всё ок и пишет CREATED без реального создания лида.
+    Эта функция ВСЕГДА raise при наличии error в ответе — иначе скрипт думает
+    что всё ок и пишет CREATED без реального создания лида.
     """
     flat = {}
 
@@ -265,17 +205,20 @@ def verify_lead_exists(lead_id) -> bool:
         return False
 
 
-def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment, assigned_by_id):
+def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
+                       assigned_by_id, extra_fields: dict | None = None):
     """
     Создаёт контакт + лид в Bitrix24, добавляет Viber-ссылку и верифицирует.
-    После создания — назначает оператора в ChatApp.
     Возвращает lead_id или бросает исключение при ошибке.
+
+    extra_fields — дополнительные поля лида (например UF_CRM_*).
 
     Порядок:
       A. crm.contact.add → contact_id
       B. crm.lead.add (с CONTACT_IDS и Viber сразу) → lead_id
       C. crm.lead.get → верификация что лид реально создан
-      D. ChatApp оператор (не блокирующий)
+
+    Назначение оператора в ChatApp вынесено в отдельный сервис (chat-assigner).
     """
 
     # ── A. Создаём контакт ──────────────────────────────────────────────────
@@ -312,6 +255,12 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
         lead_fields["IM"]                 = [{"VALUE_TYPE": "VIBER", "VALUE": phone}]
         lead_fields["UF_CRM_VIBER_LINK"]  = f"viber://chat?number={phone}"
 
+    # Дополнительные кастомные поля (Kitchen май: бюджет, флаг техники)
+    if extra_fields:
+        for k, v in extra_fields.items():
+            if v is not None:
+                lead_fields[k] = v
+
     r_lead = bitrix_call("crm.lead.add", {"fields": lead_fields})
     lead_id = r_lead.get("result")
     if not lead_id or not isinstance(lead_id, int):
@@ -329,10 +278,6 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
         )
     log.info(f"  Лид {lead_id} верифицирован ✓")
     time.sleep(BITRIX_DELAY)
-
-    # ── D. ChatApp (не блокирует, ошибки только логируем) ──────────────────
-    if phone:
-        assign_chatapp_operator(phone, assigned_by_id)
 
     return lead_id
 
@@ -501,20 +446,95 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
     return "CREATED"
 
 
+# ─── Обработка вкладки Kitchen май ─────────────────────────────────────────
+
+def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: int) -> str:
+    """
+    Обрабатывает одну строку из вкладки Kitchen май (форма Kitchen 2.0).
+    Возвращает статус.
+
+    Индексы колонок (0-based) — 20 колонок (A-T):
+      11=платформа (ig/fb)
+      12=da_li_imate_plan         (есть план стана: da/ne)
+      13=kada_planirate           (когда планирует начать)
+      14=budget                   (бюджет диапазон) → UF_CRM_1778484294109
+      15=kuhinja_ili_tehnika      (нужна ли техника)→ UF_CRM_1778484348218
+      16=email
+      17=имя
+      18=телефон
+      19=статус
+    """
+    while len(row) < 20:
+        row.append("")
+
+    status_val = row[19].strip()
+    if status_val:
+        return "SKIP"  # уже обработана
+
+    email     = row[16].strip()
+    raw_name  = row[17].strip()
+    raw_phone = row[18].strip()
+    platform  = row[11].strip()
+
+    # Данные для комментария + UF поля
+    ad             = row[3].strip()
+    adset          = row[5].strip()
+    has_plan       = row[12].strip()
+    timeline       = row[13].strip()
+    budget_raw     = row[14].strip()
+    tehnika_raw    = row[15].strip()
+    date           = row[1].strip()
+
+    phone = parse_phone(raw_phone)
+
+    # Дедупликация
+    if is_duplicate(email, phone):
+        return "DUPLICATE"
+
+    # Парсинг имени
+    name, last_name = clean_name(raw_name)
+    plat_label = platform_label(platform)
+    src_id     = get_source(platform)
+
+    title = (
+        f"{name} {last_name} — Kitchen ({plat_label})"
+        if last_name != "—"
+        else f"{name} — Kitchen ({plat_label})"
+    )
+    comment = (
+        f"Tab: Kitchen май | Ad: {ad} | Plan: {has_plan} | Timeline: {timeline} | "
+        f"Budget: {budget_raw} | Tehnika: {tehnika_raw} | Adset: {adset} | Date: {date}"
+    )
+
+    # Доп. поля (UF_CRM_*) — только если распарсились в известное значение
+    extra_fields = {}
+    budget_value = parse_budget(budget_raw)
+    if budget_value is not None:
+        extra_fields[UF_BUDGET] = budget_value
+
+    tehnika_value = parse_tehnika(tehnika_raw)
+    if tehnika_value is not None:
+        extra_fields[UF_TEHNIKA] = tehnika_value
+
+    log.info(f"  → Создаю Kitchen май лид: {title} | budget={budget_value} tehnika={tehnika_value}")
+    lead_id = create_bitrix_lead(
+        title, name, last_name, phone, email, src_id, comment, assigned_by_id,
+        extra_fields=extra_fields,
+    )
+    log.info(f"  ✓ Kitchen май → лид создан ID={lead_id}: {title}")
+    return "CREATED"
+
+
 # ─── Главная функция ─────────────────────────────────────────────────────────
 
 def run():
     log.info("=" * 60)
     log.info("Запуск импорта лидов")
 
-    # Прогреваем ChatApp токен заранее
-    get_chatapp_token()
-
     # Определяем ответственного
     assigned_by_id = get_assigned_by_id()
     weekday_name = datetime.now(timezone.utc).strftime("%A")
     log.info(f"День: {weekday_name}, ASSIGNED_BY_ID={assigned_by_id}")
-    log.info(f"ChatApp operator: {CHATAPP_OPERATOR_MAP.get(assigned_by_id, 'нет маппинга')}")
 
     # Подключаемся к Google Sheets
     gc = get_gspread_client()
@@ -539,6 +559,12 @@ def run():
             "status_col":  19,  # Колонка S (1-indexed для gspread)
             "processor":   process_ormari_row,
         },
+        {
+            "name":        "Kitchen май",
+            "range":       "A2:T500",
+            "status_col":  20,  # Колонка T (1-indexed для gspread)
+            "processor":   process_kitchen_may_row,
+        },
     ]
 
     for tab_cfg in tabs:
@@ -549,7 +575,12 @@ def run():
         log.info(f"\n── Обработка вкладки: {tab_name} ──")
 
         # Открываем лист
-        sheet = spreadsheet.worksheet(tab_name)
+        try:
+            sheet = spreadsheet.worksheet(tab_name)
+        except gspread.WorksheetNotFound:
+            log.warning(f"  Вкладка '{tab_name}' не найдена — пропускаем.")
+            continue
+
         rows  = sheet.get(tab_cfg["range"])
 
         if not rows:
