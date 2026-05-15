@@ -5,15 +5,17 @@ lead_importer.py
 
 Читает вкладки "Kitchen New", "Ormari" и "Kitchen май", проверяет дубли через
 Bitrix24 API, создаёт новые лиды и отмечает каждую строку в таблице:
-  CREATED   — лид успешно создан И ВЕРИФИЦИРОВАН в Bitrix24
-  DUPLICATE — уже существует в Bitrix24
-  ERROR: …  — что-то пошло не так (текст ошибки)
+  CREATED:ID           — лид успешно создан И ВЕРИФИЦИРОВАН в Bitrix24
+  VIBER_PENDING:ID     — лид создан, но Viber отложен до рабочего времени (8–20)
+  DUPLICATE            — уже существует в Bitrix24
+  ERROR: …             — что-то пошло не так (текст ошибки)
 
 Назначение операторов в ChatApp вынесено в отдельный сервис (chat-assigner).
 
 Переменные окружения (Railway / .env):
   GOOGLE_CREDENTIALS_JSON  — JSON сервисного аккаунта Google (одной строкой)
   BITRIX_WEBHOOK           — URL вебхука Bitrix24
+  WAZZUP_API_KEY           — API ключ WazzUp для отправки Viber
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -21,6 +23,7 @@ import os
 import re
 import json
 import time
+import random
 import logging
 from datetime import datetime, timezone
 
@@ -57,28 +60,251 @@ SOURCE_MAP = {
 LEAD_STATUS_ID = "UC_6TAZVN"
 
 
-# ─── Формат статуса в Google Sheets ─────────────────────────────────────────
-# Lead-importer пишет в колонку статуса один из форматов:
-#   CREATED:1234         — лид успешно создан с ID 1234
-#   DUPLICATE            — уже есть в Bitrix
-#   ERROR: ...           — ошибка
-#
-# Раньше писали просто "CREATED", но это уязвимо: любой посторонний
-# процесс может поставить "CREATED" в момент появления строки, и
-# lead-importer пропустит её как обработанную, лид не попадёт в Bitrix.
-#
-# Теперь: если статус НЕ соответствует нашему формату — не доверяем,
-# обрабатываем как новую строку. is_duplicate отловит реальные дубли.
+# ─── Viber / WazzUp ─────────────────────────────────────────────────────────
 
-CREATED_WITH_ID = re.compile(r"^CREATED:\d+$")
+WAZZUP_API_KEY          = os.environ.get("WAZZUP_API_KEY", "")
+WAZZUP_VIBER_CHANNEL_ID = "f0911dd4-a6b5-48ad-b39f-f9b47c171277"
+
+# Задержка между сообщениями — случайная, чтобы выглядело по-человечески
+VIBER_DELAY_MIN        = 30   # секунды
+VIBER_DELAY_MAX        = 45
+
+# Рабочие часы для отправки Viber (ночью не беспокоим клиентов)
+VIBER_WORK_HOURS_START = 8
+VIBER_WORK_HOURS_END   = 20
+
+# Шаблоны сообщений (сербский язык, утверждены носителем, 5 вариантов)
+# {name} заменяется на имя клиента при отправке
+VIBER_TEMPLATES = [
+    (
+        "Zdravo, {name}! 👋 Tvoja prijava je primljena. "
+        "Naš menadžer će te kontaktirati između 8:00 i 20:00. "
+        "Ako ti odgovara neko drugo vreme, ili ti je lakše da nastavimo komunikaciju "
+        "putem poruka, slobodno nam piši 💬 "
+        "Mere, fotografije prostora ili primer kuhinje koja ti se dopada možeš poslati odmah "
+        "— to će nam pomoći da brže pripremimo ponudu. "
+        "Tim Tekstura Buro 🏠"
+    ),
+    (
+        "Dobar dan, {name}! "
+        "Hvala na interesovanju za Tekstura Buro ✨ "
+        "Tvoja prijava je primljena, a naš menadžer će te kontaktirati između 8:00 i 20:00. "
+        "Ako ti odgovara određeno vreme za poziv, ili želiš da nastavimo komunikaciju "
+        "putem poruka, samo nam napiši — prilagodićemo se 💬"
+    ),
+    (
+        "Zdravo, {name}! 💛 "
+        "Hvala ti na interesovanju za Tekstura Buro. "
+        "Tvoja prijava je primljena — naš menadžer će te kontaktirati između 8:00 i 20:00. "
+        "Ako ti više odgovara određeno vreme za poziv ili komunikacija putem poruka, "
+        "slobodno nam piši. "
+        "Takođe, možeš nam odmah poslati mere, fotografije prostora ili render/primer "
+        "kuhinje koja ti se dopada — rado ćemo pogledati 📐"
+    ),
+    (
+        "Dobar dan, {name}! "
+        "Tim Tekstura Buro je primio tvoju prijavu 🤍 "
+        "Naš menadžer će te kontaktirati između 8:00 i 20:00. "
+        "Ako ti više odgovara neko drugo vreme ili komunikacija putem poruka, "
+        "možemo nastaviti ovde 💬 "
+        "Fotografije prostora, mere ili primer kuhinje koja ti se dopada "
+        "slobodno možeš poslati odmah."
+    ),
+    (
+        "Zdravo, {name}! 🌿 "
+        "Tvoja prijava je primljena i već je kod našeg tima. "
+        "Menadžer će te kontaktirati između 8:00 i 20:00, "
+        "a ako ti odgovara neko drugo vreme, slobodno nam napiši. "
+        "Ako ti je lakše da komuniciramo putem poruka, tu smo 💬 "
+        "Mere, fotografije prostora, render ili primer kuhinje koja ti se dopada "
+        "možeš poslati odmah — tako možemo brže da krenemo sa pripremom ponude ✨"
+    ),
+]
+
+
+def is_working_hours() -> bool:
+    """Проверяет, рабочее ли сейчас время (8:00–20:00) для отправки Viber."""
+    hour = datetime.now().hour
+    return VIBER_WORK_HOURS_START <= hour < VIBER_WORK_HOURS_END
+
+
+def get_viber_text(name: str) -> str:
+    """Выбирает случайный шаблон и подставляет имя клиента."""
+    template = random.choice(VIBER_TEMPLATES)
+    return template.format(name=name if name else "")
+
+
+def send_viber_wazzup(phone: str, name: str, lead_id: str) -> str:
+    """
+    Отправляет сообщение в Viber через WazzUp API.
+    Возвращает messageId при успехе, бросает Exception при ошибке.
+
+    crmMessageId = "lead_{lead_id}" — WazzUp игнорирует повторный запрос
+    с тем же ID в течение 60 сек, что защищает от случайных дублей.
+    """
+    chat_id = phone.lstrip("+").replace(" ", "").replace("-", "")
+
+    payload = {
+        "channelId":    WAZZUP_VIBER_CHANNEL_ID,
+        "chatType":     "viber",
+        "chatId":       chat_id,
+        "crmMessageId": f"lead_{lead_id}",
+        "text":         get_viber_text(name),
+    }
+
+    resp = requests.post(
+        "https://api.wazzup24.com/v3/message",
+        headers={
+            "Authorization": f"Bearer {WAZZUP_API_KEY}",
+            "Content-Type":  "application/json",
+        },
+        json=payload,
+        timeout=10,
+    )
+
+    data = resp.json()
+    if resp.status_code != 201:
+        raise Exception(f"WazzUp error {resp.status_code}: {data}")
+
+    return data.get("messageId", "unknown")
+
+
+def process_viber_queue(viber_queue: list):
+    """
+    Отправляет Viber-сообщения из очереди с задержкой 30–45 сек между каждым.
+    Ошибка отправки одного лида не останавливает очередь — просто логируется.
+
+    viber_queue = [{"lead_id": str, "phone": str, "name": str}, ...]
+    """
+    if not viber_queue:
+        return
+
+    log.info(f"[VIBER] Очередь отправки: {len(viber_queue)} сообщений")
+
+    for idx, item in enumerate(viber_queue):
+        try:
+            msg_id = send_viber_wazzup(
+                phone   = item["phone"],
+                name    = item["name"],
+                lead_id = str(item["lead_id"]),
+            )
+            log.info(f"[VIBER] ✅ Отправлено: лид {item['lead_id']}, msgId={msg_id}")
+        except Exception as e:
+            log.warning(f"[VIBER] ❌ Ошибка лид {item['lead_id']}: {e}")
+
+        # Пауза между сообщениями — случайная, чтобы не выглядело как бот
+        if idx < len(viber_queue) - 1:
+            delay = random.randint(VIBER_DELAY_MIN, VIBER_DELAY_MAX)
+            log.info(f"[VIBER] Пауза {delay} сек...")
+            time.sleep(delay)
+
+
+def process_pending_viber(spreadsheet, tabs_cfg: list):
+    """
+    Находит строки со статусом VIBER_PENDING:{lead_id} во всех вкладках
+    и отправляет им Viber (только в рабочее время).
+
+    Вызывается в самом начале run() — подбирает ночные лиды утром.
+    После успешной отправки статус меняется на CREATED:{lead_id}.
+    """
+    if not is_working_hours():
+        log.info("[VIBER] Нерабочее время — отложенные лиды не обрабатываем.")
+        return
+
+    pending_queue = []  # [{lead_id, phone, name, sheet, row_index, status_col, lead_id_str}, ...]
+
+    for tab_cfg in tabs_cfg:
+        tab_name   = tab_cfg["name"]
+        phone_col  = tab_cfg["phone_col"]   # 0-based индекс колонки телефона
+        name_col   = tab_cfg["name_col"]    # 0-based индекс колонки имени
+        status_col = tab_cfg["status_col"]  # 1-based для gspread.update_cell
+
+        try:
+            sheet = spreadsheet.worksheet(tab_name)
+        except gspread.WorksheetNotFound:
+            continue
+
+        rows = sheet.get(tab_cfg["range"])
+        if not rows:
+            continue
+
+        for i, row in enumerate(rows):
+            sheet_row  = i + 2
+            # Дополняем строку если она короче ожидаемой
+            while len(row) < status_col:
+                row.append("")
+
+            status_val = row[status_col - 1].strip()  # -1 потому что status_col 1-based
+
+            # Ищем статус вида "VIBER_PENDING:1234"
+            if not status_val.startswith("VIBER_PENDING:"):
+                continue
+
+            lead_id_str = status_val.replace("VIBER_PENDING:", "").strip()
+            phone_raw   = row[phone_col].strip() if len(row) > phone_col else ""
+            name_raw    = row[name_col].strip()  if len(row) > name_col  else ""
+
+            phone = phone_raw.lstrip("p:+").replace(" ", "").replace("-", "")
+            name  = name_raw.split(" ")[0] if name_raw else ""  # только имя (без фамилии)
+
+            if not phone:
+                log.warning(f"[VIBER] PENDING row {sheet_row} в '{tab_name}': нет телефона — пропускаем")
+                continue
+
+            pending_queue.append({
+                "lead_id":   lead_id_str,
+                "phone":     phone,
+                "name":      name,
+                "sheet":     sheet,
+                "sheet_row": sheet_row,
+                "status_col": status_col,
+            })
+
+    if not pending_queue:
+        log.info("[VIBER] Отложенных ночных лидов нет.")
+        return
+
+    log.info(f"[VIBER] Найдено {len(pending_queue)} отложенных ночных лидов — отправляем")
+
+    for idx, item in enumerate(pending_queue):
+        try:
+            msg_id = send_viber_wazzup(
+                phone   = item["phone"],
+                name    = item["name"],
+                lead_id = item["lead_id"],
+            )
+            # Успешно — меняем статус с VIBER_PENDING на CREATED
+            item["sheet"].update_cell(
+                item["sheet_row"],
+                item["status_col"],
+                f"CREATED:{item['lead_id']}"
+            )
+            log.info(f"[VIBER] ✅ Ночной лид {item['lead_id']} отправлен, msgId={msg_id}")
+        except Exception as e:
+            log.warning(f"[VIBER] ❌ Ошибка ночного лида {item['lead_id']}: {e}")
+
+        if idx < len(pending_queue) - 1:
+            delay = random.randint(VIBER_DELAY_MIN, VIBER_DELAY_MAX)
+            log.info(f"[VIBER] Пауза {delay} сек...")
+            time.sleep(delay)
+
+
+# ─── Формат статуса в Google Sheets ─────────────────────────────────────────
+
+CREATED_WITH_ID      = re.compile(r"^CREATED:\d+$")
+VIBER_PENDING_WITH_ID = re.compile(r"^VIBER_PENDING:\d+$")
 
 def is_our_processed_status(status_val: str) -> bool:
-    """Возвращает True если статус — наша запись (значит SKIP).
-    Просто 'CREATED' без ID считаем подозрительным и переобрабатываем."""
+    """
+    Возвращает True если статус — наша запись (строку можно пропустить).
+    Просто 'CREATED' без ID считаем подозрительным и переобрабатываем.
+    """
     s = (status_val or "").strip()
     if not s:
         return False
-    if CREATED_WITH_ID.match(s):       # CREATED:1234
+    if CREATED_WITH_ID.match(s):          # CREATED:1234
+        return True
+    if VIBER_PENDING_WITH_ID.match(s):    # VIBER_PENDING:1234
         return True
     if s == "DUPLICATE":
         return True
@@ -87,24 +313,17 @@ def is_our_processed_status(status_val: str) -> bool:
     return False
 
 # ─── Маппинги для Kitchen май ───────────────────────────────────────────────
-# Поля новой формы (Kitchen 2.0): бюджет + флаг "нужна техника"
 
-# UF_CRM_1778484294109 (money, "число|EUR")
-# Берём верхнюю границу диапазона — так уже было у руками заведённых лидов
 BUDGET_MAP = {
     "do_4.000€":     "4000|EUR",
     "4.000–6.000€":  "6000|EUR",
     "6.000–9.000€":  "9000|EUR",
     "9.000€+":       "10000|EUR",
-    # "još_nisam_siguran" → не передаём (см. parse_budget)
 }
 
-# UF_CRM_1778484348218 (boolean, "Запрос на технику")
-# Если "samo_kuhinja" — точно нет; если "kuhinja_+_tehnika" — точно да; иначе не передаём.
 TEHNIKA_MAP = {
     "samo_kuhinja":           0,
     "kuhinja_+_tehnika":      1,
-    # "još_nisam_siguran_/_sigurna" → None (не передаём)
 }
 
 UF_BUDGET  = "UF_CRM_1778484294109"
@@ -112,29 +331,22 @@ UF_TEHNIKA = "UF_CRM_1778484348218"
 
 
 def parse_budget(raw: str) -> str | None:
-    """Превращает 'do_4.000€' / '4.000–6.000€' / ... в '4000|EUR'. Иначе None."""
     return BUDGET_MAP.get(raw.strip()) if raw else None
 
 
 def parse_tehnika(raw: str) -> int | None:
-    """0 / 1 для известных значений, None для 'не уверен' и прочего."""
     return TEHNIKA_MAP.get(raw.strip()) if raw else None
 
 
 # ─── Google Sheets: авторизация ─────────────────────────────────────────────
 
 def get_gspread_client():
-    """
-    Создаёт авторизованный клиент gspread.
-    Читает credentials из переменной окружения GOOGLE_CREDENTIALS_JSON.
-    """
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
         raise EnvironmentError(
             "Переменная окружения GOOGLE_CREDENTIALS_JSON не задана. "
             "Добавь её в Railway → Variables."
         )
-    # Убираем переносы строк — Railway иногда сохраняет переменную в многострочном формате
     creds_json_clean = creds_json.strip().replace("\r\n", "").replace("\r", "")
     creds_dict = json.loads(creds_json_clean)
     scopes = [
@@ -150,12 +362,10 @@ def get_gspread_client():
 def bitrix_call(method: str, params: dict) -> dict:
     """
     Делает POST-запрос к Bitrix24 REST API.
-    Параметры передаются как form-encoded (Bitrix24 так ожидает вложенные поля).
 
-    КРИТИЧНО: Bitrix24 при логических ошибках (rate limit, auth, невалидный фильтр)
-    возвращает HTTP 200 + JSON {"error": "...", "error_description": "..."}.
-    Эта функция ВСЕГДА raise при наличии error в ответе — иначе скрипт думает
-    что всё ок и пишет CREATED без реального создания лида.
+    КРИТИЧНО: Bitrix24 при логических ошибках возвращает HTTP 200 + JSON
+    {"error": "...", "error_description": "..."}. Всегда raise при наличии
+    error в ответе — иначе скрипт думает что всё ок.
     """
     flat = {}
 
@@ -174,7 +384,6 @@ def bitrix_call(method: str, params: dict) -> dict:
     response.raise_for_status()
     data = response.json()
 
-    # Bitrix может вернуть ошибку в JSON при HTTP 200 — обрабатываем явно
     if isinstance(data, dict) and data.get("error"):
         err_code = data.get("error", "")
         err_desc = data.get("error_description", "")
@@ -185,12 +394,11 @@ def bitrix_call(method: str, params: dict) -> dict:
 
 def is_duplicate(email: str, phone: str) -> bool:
     """
-    Поиск дублей через crm.duplicate.findbycomm — это родной метод Bitrix24
-    для поиска по средствам связи. Возвращает точные совпадения.
+    Поиск дублей через crm.duplicate.findbycomm.
 
     Структура ответа Bitrix24 непоследовательная:
       Дубли есть: {"result": {"LEAD": [id1, id2]}}    ← dict
-      Дублей нет: {"result": []}                       ← list (sic!)
+      Дублей нет: {"result": []}                       ← list
     Поэтому проверяем isinstance перед .get()
     """
     def _check(comm_type: str, value: str) -> bool:
@@ -219,11 +427,7 @@ def is_duplicate(email: str, phone: str) -> bool:
 
 
 def verify_lead_exists(lead_id) -> bool:
-    """
-    Проверяет что лид реально существует в Bitrix24 после создания.
-    Защита от фантомного CREATED — если crm.lead.add вернул что-то странное,
-    crm.lead.get не найдёт лид и мы поднимем ERROR.
-    """
+    """Проверяет что лид реально существует в Bitrix24 после создания."""
     try:
         r = bitrix_call("crm.lead.get", {"id": lead_id})
         result = r.get("result")
@@ -240,20 +444,9 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
     """
     Создаёт контакт + лид в Bitrix24, добавляет Viber-ссылку и верифицирует.
     Возвращает lead_id или бросает исключение при ошибке.
-
-    extra_fields — дополнительные поля лида (например UF_CRM_*).
-
-    Порядок:
-      A. crm.contact.add → contact_id
-      B. crm.lead.add (с CONTACT_IDS и Viber сразу) → lead_id
-      C. crm.lead.get → верификация что лид реально создан
-
-    Назначение оператора в ChatApp вынесено в отдельный сервис (chat-assigner).
     """
 
     # ── A. Создаём контакт ──────────────────────────────────────────────────
-    # ASSIGNED_BY_ID обязательно: иначе Bitrix дефолтит на создателя webhook'а (user 1),
-    # и контакт получает ответственного отличного от лида — рассинхрон.
     contact_fields = {
         "NAME":           name,
         "LAST_NAME":      last_name,
@@ -264,19 +457,16 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
         contact_fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
     if phone:
         contact_fields["PHONE"] = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
-        # IM (Viber) — для синхронности с лидом
         contact_fields["IM"]    = [{"VALUE": phone, "VALUE_TYPE": "VIBER"}]
 
     r_contact = bitrix_call("crm.contact.add", {"fields": contact_fields})
     contact_id = r_contact.get("result")
     if not contact_id or not isinstance(contact_id, int):
-        raise RuntimeError(
-            f"crm.contact.add не вернул валидный ID. Ответ: {r_contact}"
-        )
+        raise RuntimeError(f"crm.contact.add не вернул валидный ID. Ответ: {r_contact}")
     log.info(f"  Контакт создан: ID={contact_id}")
     time.sleep(BITRIX_DELAY)
 
-    # ── B. Создаём лид (с привязкой к контакту и Viber-ссылкой сразу) ──────
+    # ── B. Создаём лид ──────────────────────────────────────────────────────
     lead_fields = {
         "TITLE":          title,
         "NAME":           name,
@@ -290,11 +480,10 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
     if email:
         lead_fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
     if phone:
-        lead_fields["PHONE"]              = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
-        lead_fields["IM"]                 = [{"VALUE_TYPE": "VIBER", "VALUE": phone}]
-        lead_fields["UF_CRM_VIBER_LINK"]  = f"viber://chat?number={phone}"
+        lead_fields["PHONE"]             = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
+        lead_fields["IM"]                = [{"VALUE_TYPE": "VIBER", "VALUE": phone}]
+        lead_fields["UF_CRM_VIBER_LINK"] = f"viber://chat?number={phone}"
 
-    # Дополнительные кастомные поля (Kitchen май: бюджет, флаг техники)
     if extra_fields:
         for k, v in extra_fields.items():
             if v is not None:
@@ -303,13 +492,11 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
     r_lead = bitrix_call("crm.lead.add", {"fields": lead_fields})
     lead_id = r_lead.get("result")
     if not lead_id or not isinstance(lead_id, int):
-        raise RuntimeError(
-            f"crm.lead.add не вернул валидный ID. Ответ: {r_lead}"
-        )
+        raise RuntimeError(f"crm.lead.add не вернул валидный ID. Ответ: {r_lead}")
     log.info(f"  Лид создан: ID={lead_id}")
     time.sleep(BITRIX_DELAY)
 
-    # ── C. ВЕРИФИКАЦИЯ: лид реально существует? ────────────────────────────
+    # ── C. ВЕРИФИКАЦИЯ ──────────────────────────────────────────────────────
     if not verify_lead_exists(lead_id):
         raise RuntimeError(
             f"crm.lead.add вернул ID={lead_id}, но crm.lead.get не подтверждает "
@@ -323,43 +510,28 @@ def create_bitrix_lead(title, name, last_name, phone, email, source_id, comment,
 
 # ─── Вспомогательные функции парсинга ───────────────────────────────────────
 
-# Паттерн для удаления "стилизованных" Unicode-символов типа 𝕯, 𝓜, 𝗞.
-# Оставляем базовую латиницу, кириллицу и расширенную латиницу (диакритика).
-UNICODE_JUNK = re.compile(
-    r"[^\x20-\x7E\u00C0-\u024F\u0400-\u04FF]"
-)
+UNICODE_JUNK = re.compile(r"[^\x20-\x7E\u00C0-\u024F\u0400-\u04FF]")
 
 
 def clean_name(raw: str) -> tuple[str, str]:
-    """
-    Очищает имя от тяжёлого Unicode, разбивает на NAME и LAST_NAME.
-    Если одно слово — LAST_NAME = "—".
-    """
     cleaned = UNICODE_JUNK.sub("", raw).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     if not cleaned:
-        # Если после очистки ничего не осталось — оставляем оригинал
         cleaned = raw.strip()
-
-    parts = cleaned.split(" ", 1)
+    parts     = cleaned.split(" ", 1)
     name      = parts[0]
     last_name = parts[1] if len(parts) > 1 else "—"
     return name, last_name
 
 
 def parse_phone(raw: str) -> str | None:
-    """
-    Убирает префикс "p:" из значения телефона.
-    Возвращает None если телефона нет ("0" или пусто).
-    """
     phone = raw.replace("p:", "").strip()
     return None if (phone in ("", "0")) else phone
 
 
 def get_assigned_by_id() -> int:
-    """Определяет ответственного менеджера по дню недели."""
-    weekday = datetime.now(timezone.utc).weekday()  # 0=Пн, 6=Вс
-    return 28 if weekday < 5 else 30  # Пн–Пт=28, Сб–Вс=30
+    weekday = datetime.now(timezone.utc).weekday()
+    return 28 if weekday < 5 else 30
 
 
 def get_source(platform: str) -> str:
@@ -373,27 +545,18 @@ def platform_label(platform: str) -> str:
 # ─── Обработка вкладки Kitchen New ─────────────────────────────────────────
 
 def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -> str:
-    """
-    Обрабатывает одну строку из вкладки Kitchen New.
-    Возвращает статус: "CREATED", "DUPLICATE", "SKIP", или "ERROR: ..."
-
-    Индексы колонок (0-based):
-      11=платформа, 12=размер, 13=timeline, 14=email, 15=имя, 16=телефон, 17=статус
-    """
-    # Расширяем строку до нужной длины (некоторые строки короче)
     while len(row) < 18:
         row.append("")
 
     status_val = row[17].strip()
     if is_our_processed_status(status_val):
-        return "SKIP"  # уже обработана нашим скриптом
+        return "SKIP"
 
     email     = row[14].strip()
     raw_name  = row[15].strip()
     raw_phone = row[16].strip()
     platform  = row[11].strip()
 
-    # Данные для комментария
     ad       = row[3].strip()
     adset    = row[5].strip()
     size     = row[12].strip()
@@ -402,11 +565,9 @@ def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -
 
     phone = parse_phone(raw_phone)
 
-    # Дедупликация (через crm.duplicate.findbycomm — единственный надёжный способ)
     if is_duplicate(email, phone):
         return "DUPLICATE"
 
-    # Парсинг имени
     name, last_name = clean_name(raw_name)
     plat_label = platform_label(platform)
     src_id     = get_source(platform)
@@ -430,27 +591,18 @@ def process_kitchen_row(row: list, row_index: int, sheet, assigned_by_id: int) -
 # ─── Обработка вкладки Ormari ───────────────────────────────────────────────
 
 def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) -> str:
-    """
-    Обрабатывает одну строку из вкладки Ormari.
-    Возвращает статус.
-
-    Индексы колонок (0-based):
-      11=платформа, 12=тип шкафа, 13=ширина, 14=timeline,
-      15=email, 16=имя, 17=телефон, 18=статус
-    """
     while len(row) < 19:
         row.append("")
 
     status_val = row[18].strip()
     if is_our_processed_status(status_val):
-        return "SKIP"  # уже обработана нашим скриптом
+        return "SKIP"
 
     email     = row[15].strip()
     raw_name  = row[16].strip()
     raw_phone = row[17].strip()
     platform  = row[11].strip()
 
-    # Данные для комментария
     ad       = row[3].strip()
     adset    = row[5].strip()
     wardrobe = row[12].strip()
@@ -460,11 +612,9 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
 
     phone = parse_phone(raw_phone)
 
-    # Дедупликация
     if is_duplicate(email, phone):
         return "DUPLICATE"
 
-    # Парсинг имени
     name, last_name = clean_name(raw_name)
     plat_label = platform_label(platform)
     src_id     = get_source(platform)
@@ -488,49 +638,31 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
 # ─── Обработка вкладки Kitchen май ─────────────────────────────────────────
 
 def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: int) -> str:
-    """
-    Обрабатывает одну строку из вкладки Kitchen май (форма Kitchen 2.0).
-    Возвращает статус.
-
-    Индексы колонок (0-based) — 20 колонок (A-T):
-      11=платформа (ig/fb)
-      12=da_li_imate_plan         (есть план стана: da/ne)
-      13=kada_planirate           (когда планирует начать)
-      14=budget                   (бюджет диапазон) → UF_CRM_1778484294109
-      15=kuhinja_ili_tehnika      (нужна ли техника)→ UF_CRM_1778484348218
-      16=email
-      17=имя
-      18=телефон
-      19=статус
-    """
     while len(row) < 20:
         row.append("")
 
     status_val = row[19].strip()
     if is_our_processed_status(status_val):
-        return "SKIP"  # уже обработана нашим скриптом
+        return "SKIP"
 
     email     = row[16].strip()
     raw_name  = row[17].strip()
     raw_phone = row[18].strip()
     platform  = row[11].strip()
 
-    # Данные для комментария + UF поля
-    ad             = row[3].strip()
-    adset          = row[5].strip()
-    has_plan       = row[12].strip()
-    timeline       = row[13].strip()
-    budget_raw     = row[14].strip()
-    tehnika_raw    = row[15].strip()
-    date           = row[1].strip()
+    ad          = row[3].strip()
+    adset       = row[5].strip()
+    has_plan    = row[12].strip()
+    timeline    = row[13].strip()
+    budget_raw  = row[14].strip()
+    tehnika_raw = row[15].strip()
+    date        = row[1].strip()
 
     phone = parse_phone(raw_phone)
 
-    # Дедупликация
     if is_duplicate(email, phone):
         return "DUPLICATE"
 
-    # Парсинг имени
     name, last_name = clean_name(raw_name)
     plat_label = platform_label(platform)
     src_id     = get_source(platform)
@@ -545,7 +677,6 @@ def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: in
         f"Budget: {budget_raw} | Tehnika: {tehnika_raw} | Adset: {adset} | Date: {date}"
     )
 
-    # Доп. поля (UF_CRM_*) — только если распарсились в известное значение
     extra_fields = {}
     budget_value = parse_budget(budget_raw)
     if budget_value is not None:
@@ -570,57 +701,73 @@ def run():
     log.info("=" * 60)
     log.info("Запуск импорта лидов")
 
-    # Определяем ответственного
     assigned_by_id = get_assigned_by_id()
-    weekday_name = datetime.now(timezone.utc).strftime("%A")
+    weekday_name   = datetime.now(timezone.utc).strftime("%A")
     log.info(f"День: {weekday_name}, ASSIGNED_BY_ID={assigned_by_id}")
+    log.info(f"Рабочее время для Viber: {'ДА' if is_working_hours() else 'НЕТ (ночной режим)'}")
 
-    # Подключаемся к Google Sheets
-    gc = get_gspread_client()
+    gc          = get_gspread_client()
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-    # Счётчики
+    # ── Конфигурация вкладок ─────────────────────────────────────────────
+    # phone_col и name_col — 0-based индексы для извлечения данных при
+    # добавлении в viber_queue и обработке VIBER_PENDING строк
+    tabs = [
+        {
+            "name":       "Kitchen New",
+            "range":      "A2:R500",
+            "status_col": 18,   # колонка R (1-based для gspread)
+            "processor":  process_kitchen_row,
+            "phone_col":  16,   # колонка Q (0-based)
+            "name_col":   15,   # колонка P (0-based)
+        },
+        {
+            "name":       "Ormari",
+            "range":      "A2:S500",
+            "status_col": 19,   # колонка S
+            "processor":  process_ormari_row,
+            "phone_col":  17,   # колонка R (0-based)
+            "name_col":   16,   # колонка Q (0-based)
+        },
+        {
+            "name":       "kitchen Май",
+            "range":      "A2:T500",
+            "status_col": 20,   # колонка T
+            "processor":  process_kitchen_may_row,
+            "phone_col":  18,   # колонка S (0-based)
+            "name_col":   17,   # колонка R (0-based)
+        },
+    ]
+
+    # ── ШАГ 1: обработать ночные лиды (VIBER_PENDING) ────────────────────
+    # Этот блок ищет лиды созданные ночью и шлёт им Viber утром.
+    # В нерабочее время молча возвращается без действий.
+    process_pending_viber(spreadsheet, tabs)
+
+    # ── ШАГ 2: обработать новые строки из таблицы ────────────────────────
     total_created   = 0
     total_duplicate = 0
     total_error     = 0
 
-    # ── Конфигурация вкладок ─────────────────────────────────────────────
-    tabs = [
-        {
-            "name":        "Kitchen New",
-            "range":       "A2:R500",
-            "status_col":  18,  # Колонка R (1-indexed для gspread)
-            "processor":   process_kitchen_row,
-        },
-        {
-            "name":        "Ormari",
-            "range":       "A2:S500",
-            "status_col":  19,  # Колонка S (1-indexed для gspread)
-            "processor":   process_ormari_row,
-        },
-        {
-            "name":        "kitchen Май",
-            "range":       "A2:T500",
-            "status_col":  20,  # Колонка T (1-indexed для gspread)
-            "processor":   process_kitchen_may_row,
-        },
-    ]
+    # Очередь Viber для лидов созданных в этом запуске (рабочее время)
+    viber_queue = []
 
     for tab_cfg in tabs:
         tab_name   = tab_cfg["name"]
         status_col = tab_cfg["status_col"]
         processor  = tab_cfg["processor"]
+        phone_col  = tab_cfg["phone_col"]
+        name_col   = tab_cfg["name_col"]
 
         log.info(f"\n── Обработка вкладки: {tab_name} ──")
 
-        # Открываем лист
         try:
             sheet = spreadsheet.worksheet(tab_name)
         except gspread.WorksheetNotFound:
             log.warning(f"  Вкладка '{tab_name}' не найдена — пропускаем.")
             continue
 
-        rows  = sheet.get(tab_cfg["range"])
+        rows = sheet.get(tab_cfg["range"])
 
         if not rows:
             log.info(f"  Вкладка {tab_name}: данных нет, пропускаем.")
@@ -629,22 +776,51 @@ def run():
         log.info(f"  Прочитано строк: {len(rows)}")
 
         for i, row in enumerate(rows):
-            # row_number в таблице = i + 2 (данные начинаются со строки 2)
             sheet_row = i + 2
 
             try:
                 status = processor(row, sheet_row, sheet, assigned_by_id)
 
                 if status == "SKIP":
-                    continue  # Строка уже обработана — молча пропускаем
+                    continue
 
-                # Записываем статус в таблицу
-                sheet.update_cell(sheet_row, status_col, status)
+                if status.startswith("CREATED:"):
+                    # Лид создан — решаем когда слать Viber
+                    lead_id   = status.split(":")[1]
+                    phone_raw = row[phone_col].strip() if len(row) > phone_col else ""
+                    name_raw  = row[name_col].strip()  if len(row) > name_col  else ""
 
-                if status == "CREATED" or status.startswith("CREATED:"):
+                    # clean_name убирает Unicode-мусор (𝓜, 𝗞 и т.п.) и нормализует пробелы,
+                    # затем берём только первое слово — имя без фамилии для обращения в Viber
+                    name, _ = clean_name(name_raw) if name_raw else ("", "")
+                    phone = phone_raw.lstrip("p:+").replace(" ", "").replace("-", "")
+
+                    if is_working_hours() and phone:
+                        # Рабочее время — добавляем в очередь немедленной отправки
+                        viber_queue.append({
+                            "lead_id": lead_id,
+                            "phone":   phone,
+                            "name":    name,
+                        })
+                        sheet.update_cell(sheet_row, status_col, status)
+                    elif phone:
+                        # Ночь — откладываем до утра, пишем VIBER_PENDING
+                        sheet.update_cell(sheet_row, status_col, f"VIBER_PENDING:{lead_id}")
+                        log.info(f"  [VIBER] Ночной лид {lead_id} → VIBER_PENDING (отправим утром)")
+                    else:
+                        # Нет телефона — Viber невозможен, пишем обычный CREATED
+                        sheet.update_cell(sheet_row, status_col, status)
+                        log.warning(f"  [VIBER] Лид {lead_id} без телефона — Viber пропущен")
+
                     total_created += 1
+
                 elif status == "DUPLICATE":
+                    sheet.update_cell(sheet_row, status_col, status)
                     total_duplicate += 1
+
+                else:
+                    # Любой другой статус (например ERROR) — пишем как есть
+                    sheet.update_cell(sheet_row, status_col, status)
 
             except Exception as e:
                 err_msg = f"ERROR: {str(e)[:80]}"
@@ -652,11 +828,15 @@ def run():
                 try:
                     sheet.update_cell(sheet_row, status_col, err_msg)
                 except Exception:
-                    pass  # Не можем записать ошибку — просто логируем
+                    pass
                 total_error += 1
 
-            # Небольшая пауза между строками — вежливо к API
             time.sleep(0.1)
+
+    # ── ШАГ 3: отправить Viber очередь с задержкой 30–45 сек ─────────────
+    # Viber шлём ПОСЛЕ того как все лиды записаны в Bitrix —
+    # чтобы ошибка в очереди не мешала основному импорту.
+    process_viber_queue(viber_queue)
 
     # ── Итоговый отчёт ───────────────────────────────────────────────────
     log.info("\n" + "=" * 60)
@@ -664,6 +844,7 @@ def run():
     log.info(f"  Создано лидов:    {total_created}")
     log.info(f"  Дублей пропущено: {total_duplicate}")
     log.info(f"  Ошибок:           {total_error}")
+    log.info(f"  Viber отправлено: {len(viber_queue)}")
     log.info("=" * 60)
 
 
