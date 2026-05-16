@@ -25,7 +25,8 @@ import json
 import time
 import random
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -68,6 +69,9 @@ WAZZUP_VIBER_CHANNEL_ID = "f0911dd4-a6b5-48ad-b39f-f9b47c171277"
 # Задержка между сообщениями — случайная, чтобы выглядело по-человечески
 VIBER_DELAY_MIN        = 30   # секунды
 VIBER_DELAY_MAX        = 45
+
+# Часовой пояс Сербии (Railway работает в UTC — без явного TZ будет неверное время)
+BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
 
 # Рабочие часы для отправки Viber (ночью не беспокоим клиентов)
 VIBER_WORK_HOURS_START = 8
@@ -123,8 +127,8 @@ VIBER_TEMPLATES = [
 
 
 def is_working_hours() -> bool:
-    """Проверяет, рабочее ли сейчас время (8:00–20:00) для отправки Viber."""
-    hour = datetime.now().hour
+    """Проверяет рабочее ли время (8:00–20:00) по белградскому времени."""
+    hour = datetime.now(BELGRADE_TZ).hour
     return VIBER_WORK_HOURS_START <= hour < VIBER_WORK_HOURS_END
 
 
