@@ -77,6 +77,17 @@ BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
 VIBER_WORK_HOURS_START = 8
 VIBER_WORK_HOURS_END   = 20
 
+# ─── Распределение ответственного ───────────────────────────────────────────
+# Правило (Europe/Belgrade):
+#   Пн 08:00 — Пт 17:00 → ID 28 (Djordje Tomic)
+#   Пт 17:00 — Пн 08:00 → ID 30 (Dmitrii Piskun)
+# Привязка — к моменту РЕАЛЬНОЙ отправки Viber клиенту, а не к моменту
+# создания лида в Bitrix24. Для ночных лидов (VIBER_PENDING) считаем
+# на 08:00 следующего рабочего утра.
+RESPONSIBLE_WEEKDAY = 28   # Djordje Tomic
+RESPONSIBLE_WEEKEND = 30   # Dmitrii Piskun
+FRIDAY_CUTOFF_HOUR  = 17
+
 # Шаблоны сообщений (сербский язык, утверждены носителем, 5 вариантов)
 # {name} заменяется на имя клиента при отправке
 VIBER_TEMPLATES = [
@@ -533,9 +544,62 @@ def parse_phone(raw: str) -> str | None:
     return None if (phone in ("", "0")) else phone
 
 
-def get_assigned_by_id() -> int:
-    weekday = datetime.now(timezone.utc).weekday()
-    return 28 if weekday < 5 else 30
+# ─── Расчёт ответственного ──────────────────────────────────────────────────
+
+def get_send_time(created_at: datetime) -> datetime:
+    """
+    Возвращает время, когда клиенту реально уйдёт Viber.
+
+    - Дневной лид (08:00–20:00)   → отправка сразу = created_at
+    - Поздний вечер (20:00–24:00) → завтра в 08:00
+    - Ночь / раннее утро (00:00–08:00) → сегодня в 08:00
+    """
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=BELGRADE_TZ)
+
+    h = created_at.hour
+
+    # Дневной лид — отправка сразу
+    if VIBER_WORK_HOURS_START <= h < VIBER_WORK_HOURS_END:
+        return created_at
+
+    # Ночной лид — утром в 08:00
+    base = created_at + timedelta(days=1) if h >= VIBER_WORK_HOURS_END else created_at
+    return base.replace(hour=VIBER_WORK_HOURS_START, minute=0, second=0, microsecond=0)
+
+
+def get_responsible_id(now_belgrade: datetime | None = None) -> int:
+    """
+    Возвращает ID ответственного по правилу teksturaburo.
+
+    Правило (Europe/Belgrade):
+        Пн 08:00 — Пт 17:00 → 28 (Djordje Tomic)
+        Пт 17:00 — Пн 08:00 → 30 (Dmitrii Piskun)
+
+    Привязка — к моменту, когда клиент получит первое Viber-сообщение
+    (для ночных лидов это утро следующего дня, не время создания лида).
+
+    Параметр now_belgrade нужен только для тестов и переобработки старых лидов.
+    """
+    if now_belgrade is None:
+        now_belgrade = datetime.now(BELGRADE_TZ)
+    elif now_belgrade.tzinfo is None:
+        now_belgrade = now_belgrade.replace(tzinfo=BELGRADE_TZ)
+
+    send_time = get_send_time(now_belgrade)
+    wd = send_time.weekday()   # 0=Пн ... 6=Вс
+    hour = send_time.hour
+
+    # Сб, Вс — целиком на Дмитрия
+    if wd in (5, 6):
+        return RESPONSIBLE_WEEKEND
+    # Пятница после 17:00
+    if wd == 4 and hour >= FRIDAY_CUTOFF_HOUR:
+        return RESPONSIBLE_WEEKEND
+    # Понедельник до 08:00 (редкий кейс — send_time почти всегда ≥ 08:00)
+    if wd == 0 and hour < VIBER_WORK_HOURS_START:
+        return RESPONSIBLE_WEEKEND
+    return RESPONSIBLE_WEEKDAY
 
 
 def get_source(platform: str) -> str:
@@ -705,9 +769,8 @@ def run():
     log.info("=" * 60)
     log.info("Запуск импорта лидов")
 
-    assigned_by_id = get_assigned_by_id()
-    weekday_name   = datetime.now(timezone.utc).strftime("%A")
-    log.info(f"День: {weekday_name}, ASSIGNED_BY_ID={assigned_by_id}")
+    now_bel = datetime.now(BELGRADE_TZ)
+    log.info(f"Время Belgrade: {now_bel:%A %Y-%m-%d %H:%M:%S}")
     log.info(f"Рабочее время для Viber: {'ДА' if is_working_hours() else 'НЕТ (ночной режим)'}")
 
     gc          = get_gspread_client()
@@ -783,6 +846,14 @@ def run():
             sheet_row = i + 2
 
             try:
+                # Ответственный считается ДЛЯ КАЖДОГО ЛИДА ОТДЕЛЬНО.
+                # Это важно потому что:
+                #   - cron может стартовать на границе пт 16:59 → пт 17:01;
+                #     первые лиды должны уйти на 28, последние — на 30
+                #   - в одном батче могут быть и дневные, и ночные лиды;
+                #     ответственный считается на момент реальной отправки Viber
+                assigned_by_id = get_responsible_id()
+
                 status = processor(row, sheet_row, sheet, assigned_by_id)
 
                 if status == "SKIP":
@@ -807,14 +878,15 @@ def run():
                             "name":    name,
                         })
                         sheet.update_cell(sheet_row, status_col, status)
+                        log.info(f"  [ASSIGN] Лид {lead_id} → ответственный {assigned_by_id}")
                     elif phone:
                         # Ночь — откладываем до утра, пишем VIBER_PENDING
                         sheet.update_cell(sheet_row, status_col, f"VIBER_PENDING:{lead_id}")
-                        log.info(f"  [VIBER] Ночной лид {lead_id} → VIBER_PENDING (отправим утром)")
+                        log.info(f"  [VIBER] Ночной лид {lead_id} → VIBER_PENDING (отправим утром), ответственный {assigned_by_id}")
                     else:
                         # Нет телефона — Viber невозможен, пишем обычный CREATED
                         sheet.update_cell(sheet_row, status_col, status)
-                        log.warning(f"  [VIBER] Лид {lead_id} без телефона — Viber пропущен")
+                        log.warning(f"  [VIBER] Лид {lead_id} без телефона — Viber пропущен, ответственный {assigned_by_id}")
 
                     total_created += 1
 
