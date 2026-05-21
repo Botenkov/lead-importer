@@ -3,8 +3,9 @@ lead_importer.py
 ────────────────────────────────────────────────────────────────────────────
 Импорт лидов из Google Sheets → Bitrix24.
 
-Читает вкладки "Kitchen New", "Ormari" и "Kitchen май", проверяет дубли через
-Bitrix24 API, создаёт новые лиды и отмечает каждую строку в таблице:
+Читает вкладки "Kitchen New", "Ormari", "Kitchen май" и "Kitchen MAY-copy",
+проверяет дубли через Bitrix24 API, создаёт новые лиды и отмечает каждую
+строку в таблице:
   CREATED:ID           — лид успешно создан И ВЕРИФИЦИРОВАН в Bitrix24
   VIBER_PENDING:ID     — лид создан, но Viber отложен до рабочего времени (8–20)
   DUPLICATE            — уже существует в Bitrix24
@@ -26,6 +27,7 @@ import time
 import random
 import logging
 from datetime import datetime, timezone, timedelta
+from functools import partial
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -703,9 +705,19 @@ def process_ormari_row(row: list, row_index: int, sheet, assigned_by_id: int) ->
     return f"CREATED:{lead_id}"
 
 
-# ─── Обработка вкладки Kitchen май ─────────────────────────────────────────
+# ─── Обработка вкладки Kitchen май / Kitchen MAY-copy ──────────────────────
+# Обе вкладки имеют идентичную структуру (это копии одной FB Lead Ads формы),
+# поэтому используется один processor с параметром tab_label, который пишется
+# в комментарий лида и в логи. Для Kitchen MAY-copy подключается через
+# functools.partial в массиве tabs.
 
-def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: int) -> str:
+def process_kitchen_may_row(
+    row: list,
+    row_index: int,
+    sheet,
+    assigned_by_id: int,
+    tab_label: str = "kitchen Май",
+) -> str:
     while len(row) < 20:
         row.append("")
 
@@ -741,7 +753,7 @@ def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: in
         else f"{name} — Kitchen ({plat_label})"
     )
     comment = (
-        f"Tab: kitchen Май | Ad: {ad} | Plan: {has_plan} | Timeline: {timeline} | "
+        f"Tab: {tab_label} | Ad: {ad} | Plan: {has_plan} | Timeline: {timeline} | "
         f"Budget: {budget_raw} | Tehnika: {tehnika_raw} | Adset: {adset} | Date: {date}"
     )
 
@@ -754,12 +766,12 @@ def process_kitchen_may_row(row: list, row_index: int, sheet, assigned_by_id: in
     if tehnika_value is not None:
         extra_fields[UF_TEHNIKA] = tehnika_value
 
-    log.info(f"  → Создаю kitchen Май лид: {title} | budget={budget_value} tehnika={tehnika_value}")
+    log.info(f"  → Создаю {tab_label} лид: {title} | budget={budget_value} tehnika={tehnika_value}")
     lead_id = create_bitrix_lead(
         title, name, last_name, phone, email, src_id, comment, assigned_by_id,
         extra_fields=extra_fields,
     )
-    log.info(f"  ✓ kitchen Май → лид создан ID={lead_id}: {title}")
+    log.info(f"  ✓ {tab_label} → лид создан ID={lead_id}: {title}")
     return f"CREATED:{lead_id}"
 
 
@@ -800,9 +812,19 @@ def run():
             "name":       "kitchen Май",
             "range":      "A2:T500",
             "status_col": 20,   # колонка T
-            "processor":  process_kitchen_may_row,
+            "processor":  process_kitchen_may_row,    # tab_label по умолчанию "kitchen Май"
             "phone_col":  18,   # колонка S (0-based)
             "name_col":   17,   # колонка R (0-based)
+        },
+        {
+            # Структура идентична kitchen Май — переиспользуем тот же processor
+            # через functools.partial с другим tab_label для комментария лида.
+            "name":       "Kitchen MAY-copy",
+            "range":      "A2:T500",
+            "status_col": 20,   # колонка T (lead_status)
+            "processor":  partial(process_kitchen_may_row, tab_label="Kitchen MAY-copy"),
+            "phone_col":  18,   # колонка S (0-based) — phone
+            "name_col":   17,   # колонка R (0-based) — full_name
         },
     ]
 
