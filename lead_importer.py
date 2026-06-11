@@ -145,13 +145,58 @@ def is_working_hours() -> bool:
     return VIBER_WORK_HOURS_START <= hour < VIBER_WORK_HOURS_END
 
 
-def get_viber_text(name: str) -> str:
-    """Выбирает случайный шаблон и подставляет имя клиента."""
-    template = random.choice(VIBER_TEMPLATES)
-    return template.format(name=name if name else "")
+# ─── Сегментированные приветствия Milica (КУХНИ) ────────────────────────────
+# Ви-регистр (персирање), экавица, женский род. Сегментация по полю Tehnika из формы
+# (есть только во вкладке «kitchen Май»; Kitchen New без Tehnika → ветка C). Ротация 1/2:
+# вариант 1 — «hvala vam na upitu», вариант 2 — «hvala vam na interesovanju».
+# Тексты валидированы носителем (сербский ресёрч 11.06). Шкафы (Ormari) — на общих VIBER_TEMPLATES.
+WELCOME_KITCHEN = {
+    "A": [  # samo_kuhinja — только кухня
+        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Sa zadovoljstvom ću vam pomoći oko kuhinje. Treba mi samo par detalja pa da vam pripremim okvirnu cenu. Predlažem da se dopisujemo ovde, a ako vam je draže da se čujemo telefonom, tu sam i za to.",
+        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Rado bih vam pomogla da dođemo do okvirne cene za vašu kuhinju — postaviću par pitanja, neće oduzeti mnogo vremena. Predlažem da se dopisujemo ovde, a ako biste želeli da se čujemo telefonom, samo recite — biće mi drago.",
+    ],
+    "B": [  # kuhinja_+_tehnika — кухня и техника
+        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Rado ću vam pomoći oko kuhinje, a po želji i oko bele tehnike, da sve bude u jednoj ponudi pa da imate potpunu sliku. Treba mi samo par detalja o kuhinji za okvirnu cenu. Što se bele tehnike tiče — mogu da vas posavetujem oko svakog tehničkog pitanja. Predlažem da se dopisujemo ovde, a ako vam je draže telefonom, tu sam i za to.",
+        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Sa zadovoljstvom ću vam pomoći i oko kuhinje i oko bele tehnike — mogu sve da objedinim u jednu ponudu, da odmah imate potpunu cenu. Par detalja o kuhinji — neće oduzeti mnogo vremena, a oko bele tehnike mogu da vas posavetujem oko svakog tehničkog pitanja. Predlažem da se dopisujemo ovde, a ako vam više odgovara da se čujemo, samo recite.",
+    ],
+    "C": [  # još_nisam_siguran / пусто / Kitchen New без поля Tehnika
+        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Sa zadovoljstvom ću vam pomoći oko kuhinje. Par detalja — pa da vam pripremim okvirnu cenu. Predlažem da se dopisujemo ovde, a ako vam je draže da se čujemo, tu sam i za to.",
+        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Rado bih vam pomogla da dođemo do okvirne cene za kuhinju — postaviću par pitanja, neće oduzeti mnogo vremena. Predlažem da se dopisujemo ovde, a ako biste želeli da se čujemo, samo recite — biće mi drago.",
+    ],
+}
+WELCOME_NO_RUSH = "Bez žurbe — pripremiću vam ponudu da bude spremna za trenutak kada vam bude odgovaralo."
+# Срок «не горит» → добавляем строку без спешки. TODO: сверить реальные значения Timeline в форме.
+_NO_RUSH_RE = re.compile(r"kasnij|naredn|2\s*[–-]?\s*3|nekoliko\s*mesec", re.I)
 
 
-def send_viber_wazzup(phone: str, name: str, lead_id: str) -> str:
+def _kitchen_branch(tehnika_raw: str) -> str:
+    t = (tehnika_raw or "").strip().lower()
+    if t == "samo_kuhinja":
+        return "A"
+    if t == "kuhinja_+_tehnika":
+        return "B"
+    return "C"  # još_nisam_siguran / пусто / нет поля Tehnika
+
+
+def pick_welcome(name: str, product: str = "kitchen", tehnika_raw: str = "", timeline: str = "") -> str:
+    """Выбрать приветствие: кухни — сегментировано по Tehnika + ротация + строка «без спешки»;
+    шкафы (wardrobe) — пока на общих VIBER_TEMPLATES (кухонные тексты не подходят)."""
+    name = name or ""
+    if product == "wardrobe":
+        return random.choice(VIBER_TEMPLATES).format(name=name)
+    text = random.choice(WELCOME_KITCHEN[_kitchen_branch(tehnika_raw)])
+    if timeline and _NO_RUSH_RE.search(timeline):
+        text = text + " " + WELCOME_NO_RUSH
+    return text.format(name=name)
+
+
+def get_viber_text(name: str, product: str = "kitchen", tehnika_raw: str = "", timeline: str = "") -> str:
+    """Текст приветствия для клиента (по умолчанию — кухня, ветка C)."""
+    return pick_welcome(name, product, tehnika_raw, timeline)
+
+
+def send_viber_wazzup(phone: str, name: str, lead_id: str,
+                      product: str = "kitchen", tehnika_raw: str = "", timeline: str = "") -> str:
     """
     Отправляет сообщение в Viber через WazzUp API.
     Возвращает messageId при успехе, бросает Exception при ошибке.
@@ -166,7 +211,7 @@ def send_viber_wazzup(phone: str, name: str, lead_id: str) -> str:
         "chatType":     "viber",
         "chatId":       chat_id,
         "crmMessageId": f"lead_{lead_id}",
-        "text":         get_viber_text(name),
+        "text":         get_viber_text(name, product, tehnika_raw, timeline),
     }
 
     resp = requests.post(
@@ -201,9 +246,12 @@ def process_viber_queue(viber_queue: list):
     for idx, item in enumerate(viber_queue):
         try:
             msg_id = send_viber_wazzup(
-                phone   = item["phone"],
-                name    = item["name"],
-                lead_id = str(item["lead_id"]),
+                phone       = item["phone"],
+                name        = item["name"],
+                lead_id     = str(item["lead_id"]),
+                product     = item.get("product", "kitchen"),
+                tehnika_raw = item.get("tehnika_raw", ""),
+                timeline    = item.get("timeline", ""),
             )
             log.info(f"[VIBER] ✅ Отправлено: лид {item['lead_id']}, msgId={msg_id}")
         except Exception as e:
@@ -235,6 +283,9 @@ def process_pending_viber(spreadsheet, tabs_cfg: list):
         phone_col  = tab_cfg["phone_col"]   # 0-based индекс колонки телефона
         name_col   = tab_cfg["name_col"]    # 0-based индекс колонки имени
         status_col = tab_cfg["status_col"]  # 1-based для gspread.update_cell
+        product      = tab_cfg.get("product", "kitchen")     # kitchen | wardrobe (для выбора приветствия)
+        timeline_col = tab_cfg.get("timeline_col")           # 0-based; для строки «без спешки»
+        tehnika_col  = tab_cfg.get("tehnika_col")            # 0-based; только «kitchen Май»
 
         try:
             sheet = spreadsheet.worksheet(tab_name)
@@ -268,6 +319,8 @@ def process_pending_viber(spreadsheet, tabs_cfg: list):
                 log.warning(f"[VIBER] PENDING row {sheet_row} в '{tab_name}': нет телефона — пропускаем")
                 continue
 
+            timeline_v = row[timeline_col].strip() if timeline_col is not None and len(row) > timeline_col else ""
+            tehnika_v  = row[tehnika_col].strip()  if tehnika_col  is not None and len(row) > tehnika_col  else ""
             pending_queue.append({
                 "lead_id":   lead_id_str,
                 "phone":     phone,
@@ -275,6 +328,9 @@ def process_pending_viber(spreadsheet, tabs_cfg: list):
                 "sheet":     sheet,
                 "sheet_row": sheet_row,
                 "status_col": status_col,
+                "product":     product,
+                "tehnika_raw": tehnika_v,
+                "timeline":    timeline_v,
             })
 
     if not pending_queue:
@@ -286,9 +342,12 @@ def process_pending_viber(spreadsheet, tabs_cfg: list):
     for idx, item in enumerate(pending_queue):
         try:
             msg_id = send_viber_wazzup(
-                phone   = item["phone"],
-                name    = item["name"],
-                lead_id = item["lead_id"],
+                phone       = item["phone"],
+                name        = item["name"],
+                lead_id     = item["lead_id"],
+                product     = item.get("product", "kitchen"),
+                tehnika_raw = item.get("tehnika_raw", ""),
+                timeline    = item.get("timeline", ""),
             )
             # Успешно — меняем статус с VIBER_PENDING на CREATED
             item["sheet"].update_cell(
@@ -799,6 +858,8 @@ def run():
             "processor":  process_kitchen_row,
             "phone_col":  16,   # колонка Q (0-based)
             "name_col":   15,   # колонка P (0-based)
+            "product":      "kitchen",
+            "timeline_col": 13,   # колонка N (0-based) — Timeline; Tehnika в этой вкладке нет → ветка C
         },
         {
             "name":       "Ormari",
@@ -807,6 +868,8 @@ def run():
             "processor":  process_ormari_row,
             "phone_col":  17,   # колонка R (0-based)
             "name_col":   16,   # колонка Q (0-based)
+            "product":      "wardrobe",   # шкафы — кухонные тексты не подходят, идёт на общие VIBER_TEMPLATES
+            "timeline_col": 14,   # колонка O (0-based) — Timeline
         },
         {
             "name":       "kitchen Май",
@@ -815,6 +878,9 @@ def run():
             "processor":  process_kitchen_may_row,    # tab_label по умолчанию "kitchen Май"
             "phone_col":  18,   # колонка S (0-based)
             "name_col":   17,   # колонка R (0-based)
+            "product":      "kitchen",
+            "timeline_col": 13,   # колонка N (0-based) — Timeline
+            "tehnika_col":  15,   # колонка P (0-based) — Tehnika (samo_kuhinja / kuhinja_+_tehnika / …)
         },
         {
             # Структура идентична kitchen Май — переиспользуем тот же processor
@@ -825,6 +891,9 @@ def run():
             "processor":  partial(process_kitchen_may_row, tab_label="Kitchen MAY-copy"),
             "phone_col":  18,   # колонка S (0-based) — phone
             "name_col":   17,   # колонка R (0-based) — full_name
+            "product":      "kitchen",   # идентична kitchen Май → та же сегментация A/B/C + no-rush
+            "timeline_col": 13,
+            "tehnika_col":  15,
         },
     ]
 
@@ -847,6 +916,9 @@ def run():
         processor  = tab_cfg["processor"]
         phone_col  = tab_cfg["phone_col"]
         name_col   = tab_cfg["name_col"]
+        product      = tab_cfg.get("product", "kitchen")
+        timeline_col = tab_cfg.get("timeline_col")
+        tehnika_col  = tab_cfg.get("tehnika_col")
 
         log.info(f"\n── Обработка вкладки: {tab_name} ──")
 
@@ -892,12 +964,18 @@ def run():
                     name, _ = clean_name(name_raw) if name_raw else ("", "")
                     phone = phone_raw.lstrip("p:+").replace(" ", "").replace("-", "")
 
+                    timeline_v = row[timeline_col].strip() if timeline_col is not None and len(row) > timeline_col else ""
+                    tehnika_v  = row[tehnika_col].strip()  if tehnika_col  is not None and len(row) > tehnika_col  else ""
+
                     if is_working_hours() and phone:
                         # Рабочее время — добавляем в очередь немедленной отправки
                         viber_queue.append({
-                            "lead_id": lead_id,
-                            "phone":   phone,
-                            "name":    name,
+                            "lead_id":     lead_id,
+                            "phone":       phone,
+                            "name":        name,
+                            "product":     product,
+                            "tehnika_raw": tehnika_v,
+                            "timeline":    timeline_v,
                         })
                         sheet.update_cell(sheet_row, status_col, status)
                         log.info(f"  [ASSIGN] Лид {lead_id} → ответственный {assigned_by_id}")
