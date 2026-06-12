@@ -60,7 +60,7 @@ SOURCE_MAP = {
     "fb": "UC_EXNWD9",  # Facebook
 }
 
-LEAD_STATUS_ID = "UC_6TAZVN"
+LEAD_STATUS_ID = "UC_SRP1D8"   # «New sale AI» — лиды ведёт Milica (бот 2296, worker_milica)
 
 
 # ─── Viber / WazzUp ─────────────────────────────────────────────────────────
@@ -80,14 +80,12 @@ VIBER_WORK_HOURS_START = 8
 VIBER_WORK_HOURS_END   = 20
 
 # ─── Распределение ответственного ───────────────────────────────────────────
-# Правило (Europe/Belgrade):
-#   Пн 08:00 — Пт 17:00 → ID 28 (Djordje Tomic)
-#   Пт 17:00 — Пн 08:00 → ID 30 (Dmitrii Piskun)
-# Привязка — к моменту РЕАЛЬНОЙ отправки Viber клиенту, а не к моменту
-# создания лида в Bitrix24. Для ночных лидов (VIBER_PENDING) считаем
-# на 08:00 следующего рабочего утра.
-RESPONSIBLE_WEEKDAY = 28   # Djordje Tomic
-RESPONSIBLE_WEEKEND = 30   # Dmitrii Piskun
+# GO-LIVE Milica (12.06.2026): ВСЕ новые лиды — на Milica (бот 2296), она ведёт их
+# в открытых линиях (worker_milica). Старое правило «Djordje 28 будни / Piskun 30
+# выходные по времени отправки Viber» отключено приравниванием констант (функция
+# get_responsible() осталась — откат = вернуть 28/30 в две строки ниже).
+RESPONSIBLE_WEEKDAY = 2296   # Milica (была 28 — Djordje Tomic)
+RESPONSIBLE_WEEKEND = 2296   # Milica (была 30 — Dmitrii Piskun)
 FRIDAY_CUTOFF_HOUR  = 17
 
 # Шаблоны сообщений (сербский язык, утверждены носителем, 5 вариантов)
