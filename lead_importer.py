@@ -90,49 +90,24 @@ FRIDAY_CUTOFF_HOUR  = 17
 
 # Шаблоны сообщений (сербский язык, утверждены носителем, 5 вариантов)
 # {name} заменяется на имя клиента при отправке
+# Общие welcome (шкафы и прочая мебель; кухни — WELCOME_KITCHEN ниже).
+# Ви-регистр (персирање) как у кухонных — Milica продолжает диалог на Ви, welcome обязан совпадать.
+# Старые ty-шаблоны («Tvoja prijava… menadžer će te kontaktirati») убраны 12.06: «ты» + обещание
+# звонка против нового флоу (упор на переписку, ведёт Milica) + упоминали кухню для шкафных лидов.
 VIBER_TEMPLATES = [
     (
-        "Zdravo, {name}! 👋 Tvoja prijava je primljena. "
-        "Naš menadžer će te kontaktirati između 8:00 i 20:00. "
-        "Ako ti odgovara neko drugo vreme, ili ti je lakše da nastavimo komunikaciju "
-        "putem poruka, slobodno nam piši 💬 "
-        "Mere, fotografije prostora ili primer kuhinje koja ti se dopada možeš poslati odmah "
-        "— to će nam pomoći da brže pripremimo ponudu. "
-        "Tim Tekstura Buro 🏠"
+        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! "
+        "Sa zadovoljstvom ću vam pomoći oko nameštaja po meri. Treba mi samo par detalja "
+        "pa da vam pripremim okvirnu cenu. Mere, fotografije prostora ili primer koji vam se "
+        "dopada možete poslati odmah. Predlažem da se dopisujemo ovde, a ako vam je draže "
+        "da se čujemo telefonom, tu sam i za to."
     ),
     (
-        "Dobar dan, {name}! "
-        "Hvala na interesovanju za Tekstura Buro ✨ "
-        "Tvoja prijava je primljena, a naš menadžer će te kontaktirati između 8:00 i 20:00. "
-        "Ako ti odgovara određeno vreme za poziv, ili želiš da nastavimo komunikaciju "
-        "putem poruka, samo nam napiši — prilagodićemo se 💬"
-    ),
-    (
-        "Zdravo, {name}! 💛 "
-        "Hvala ti na interesovanju za Tekstura Buro. "
-        "Tvoja prijava je primljena — naš menadžer će te kontaktirati između 8:00 i 20:00. "
-        "Ako ti više odgovara određeno vreme za poziv ili komunikacija putem poruka, "
-        "slobodno nam piši. "
-        "Takođe, možeš nam odmah poslati mere, fotografije prostora ili render/primer "
-        "kuhinje koja ti se dopada — rado ćemo pogledati 📐"
-    ),
-    (
-        "Dobar dan, {name}! "
-        "Tim Tekstura Buro je primio tvoju prijavu 🤍 "
-        "Naš menadžer će te kontaktirati između 8:00 i 20:00. "
-        "Ako ti više odgovara neko drugo vreme ili komunikacija putem poruka, "
-        "možemo nastaviti ovde 💬 "
-        "Fotografije prostora, mere ili primer kuhinje koja ti se dopada "
-        "slobodno možeš poslati odmah."
-    ),
-    (
-        "Zdravo, {name}! 🌿 "
-        "Tvoja prijava je primljena i već je kod našeg tima. "
-        "Menadžer će te kontaktirati između 8:00 i 20:00, "
-        "a ako ti odgovara neko drugo vreme, slobodno nam napiši. "
-        "Ako ti je lakše da komuniciramo putem poruka, tu smo 💬 "
-        "Mere, fotografije prostora, render ili primer kuhinje koja ti se dopada "
-        "možeš poslati odmah — tako možemo brže da krenemo sa pripremom ponude ✨"
+        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! "
+        "Rado bih vam pomogla da dođemo do okvirne cene — postaviću par pitanja, neće "
+        "oduzeti mnogo vremena. Ako imate mere, fotografije prostora ili primer koji vam se "
+        "dopada, slobodno pošaljite odmah. Predlažem da se dopisujemo ovde, a ako biste "
+        "želeli da se čujemo, samo recite — biće mi drago."
     ),
 ]
 
