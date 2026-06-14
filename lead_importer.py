@@ -923,11 +923,51 @@ def _route_return_lead(ld: dict, cid: int, deals: list) -> str:
     return f"→ «Повторный/дубль» (прошлая сделка Milica/без менеджера #{last.get('ID')})"
 
 
+def _lead_session_manager(lead_id) -> int:
+    """ID живого менеджера (из RETURN_STAGE_MAP), который ВЁЛ открытую линию этого лида — по автору
+    активити-сессии IMOPENLINES_SESSION (берём последнюю с человеком-менеджером). Milica-сессии
+    (author 2296) и без человека → 0. Сигнал «менеджер уже общался» для лидов БЕЗ контакта/сделки
+    (кейс 4924: WhatsApp без контакта, 4 сессии вёл Piskun, висел в «Новый лид»). Решение Дмитрия 14.06."""
+    try:
+        acts = bitrix_call("crm.activity.list", {
+            "filter": {"OWNER_TYPE_ID": 1, "OWNER_ID": int(lead_id), "PROVIDER_ID": "IMOPENLINES_SESSION"},
+            "select": ["ID", "AUTHOR_ID"], "order": {"ID": "DESC"}}).get("result", []) or []
+    except Exception as e:
+        log.warning(f"[RETURN] сессии лида {lead_id} не получены: {e}")
+        return 0
+    for a in acts:
+        au = int(a.get("AUTHOR_ID") or 0)
+        if au in RETURN_STAGE_MAP:
+            return au
+    return 0
+
+
+def _route_lead_to_manager(lead_id, cid, mgr: int) -> str:
+    """Лид (без сделки) → колонка менеджера, который вёл его открытую линию + дело «проверить»."""
+    stage = RETURN_STAGE_MAP[mgr]
+    bitrix_call("crm.lead.update", {"id": lead_id, "fields": {"STATUS_ID": stage, "ASSIGNED_BY_ID": mgr}})
+    if cid:
+        bitrix_call("crm.contact.update", {"id": cid, "fields": {"ASSIGNED_BY_ID": mgr}})
+    try:
+        bitrix_call("crm.activity.todo.add", {
+            "ownerTypeId": 1, "ownerId": int(lead_id), "responsibleId": mgr,
+            "deadline": datetime.now(BELGRADE_TZ).replace(microsecond=0).isoformat(),
+            "title": "Лид менеджера — проверить (висел в «Новый лид»)",
+            "description": ("Открытую линию этого лида вёл ты (есть твой ответ в чате), но лид застрял в "
+                            "«Новый лид». Перенесён в твою колонку — проверь/закрой/возобнови."),
+            "pingOffsets": [0]})
+    except Exception as e:
+        log.warning(f"[RETURN] лид {lead_id}: дело не создано: {e}")
+    return f"→ менеджеру {mgr} (стадия {stage}, вёл открытую линию)"
+
+
 def cleanup_duplicate_leads() -> int:
-    """Возврат известного клиента: у контакта свежего NEW-лида УЖЕ есть сделка → НЕ дубль-баг, а повторное
-    обращение. Маршрутизируем прошлому менеджеру (лид+контакт+стадия-колонка+дело), Milica-сделку/без
-    менеджера — паркуем «Повторный/дубль». Milica сама отходит (poller._owned_by_human: у контакта есть
-    сделка человека → не лезет). Новый клиент (сделок нет) и лиды без контакта — не трогаем. Дмитрий 14.06."""
+    """Возврат/лид менеджера в «Новый лид» → в колонку менеджера, чтобы не повисло. Два сигнала:
+    (1) у контакта свежего NEW-лида есть СДЕЛКА человека → прошлому менеджеру (лид+контакт+стадия+дело);
+        Milica-сделка/без менеджера → парковка «Повторный/дубль».
+    (2) лид БЕЗ сделки/контакта, но открытую линию вёл живой менеджер (28/30) → его колонка (кейс 4924).
+    Milica сама отходит (poller._owned_by_human). Новый клиент (нет ни сделки, ни менеджер-сессии) — не
+    трогаем. Решение Дмитрия 14.06."""
     if not DUP_CLEANUP_ENABLED:
         return 0
     since = (datetime.now(BELGRADE_TZ) - timedelta(days=DUP_CLEANUP_MAX_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -940,23 +980,26 @@ def cleanup_duplicate_leads() -> int:
         return 0
     handled = 0
     for ld in leads:
+        lead_id = ld["ID"]
         cid = ld.get("CONTACT_ID")
-        if not cid:
-            continue
         try:
-            deals = bitrix_call("crm.deal.list", {
-                "filter": {"CONTACT_ID": cid}, "select": ["ID", "ASSIGNED_BY_ID"]}).get("result", []) or []
+            # (1) возврат по СДЕЛКЕ контакта — надёжный сигнал
+            if cid:
+                deals = bitrix_call("crm.deal.list", {
+                    "filter": {"CONTACT_ID": cid}, "select": ["ID", "ASSIGNED_BY_ID"]}).get("result", []) or []
+                if deals:
+                    action = _route_return_lead(ld, cid, deals)
+                    log.info(f"[RETURN] лид {lead_id} (контакт {cid}) {action}")
+                    handled += 1
+                    continue
+            # (2) лид без сделки, но открытую линию вёл живой менеджер → его колонка
+            mgr = _lead_session_manager(lead_id)
+            if mgr in RETURN_STAGE_MAP:
+                action = _route_lead_to_manager(lead_id, cid, mgr)
+                log.info(f"[RETURN] лид {lead_id} (сессию вёл менеджер {mgr}) {action}")
+                handled += 1
         except Exception as e:
-            log.warning(f"[RETURN] сделки контакта {cid} не проверены: {e}")
-            continue
-        if not deals:
-            continue                                   # у контакта нет сделок → новый клиент, не трогаем
-        try:
-            action = _route_return_lead(ld, cid, deals)
-            log.info(f"[RETURN] лид {ld['ID']} (контакт {cid}) {action}")
-            handled += 1
-        except Exception as e:
-            log.error(f"[RETURN] лид {ld['ID']}: маршрутизация не удалась: {e}")
+            log.error(f"[RETURN] лид {lead_id}: маршрутизация не удалась: {e}")
     return handled
 
 
