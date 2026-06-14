@@ -95,6 +95,24 @@ RETURN_ROUTING_ENABLED = os.environ.get("MILICA_RETURN_ROUTING_ENABLED", "true")
 RETURN_STAGE_MAP = _parse_stage_map(
     os.environ.get("MILICA_RETURN_STAGE_MAP", "30:UC_98EDOH,28:UC_WLE3S8"))
 
+# Email-лиды: входящее письмо на наш ящик → распределить лид в стадию-колонку этого ящика (Дмитрий 14.06).
+# Ящик-получатель берём из bound email-активити (SETTINGS.EMAIL_META.__email). Только свежие NEW; стадия
+# (ответственного/диалог не трогаем — email не Milica-канал). 0/false = выкл.
+EMAIL_ROUTING_ENABLED = os.environ.get("MILICA_EMAIL_ROUTING_ENABLED", "true").lower() == "true"
+
+def _parse_email_map(raw: str) -> dict:
+    out = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            if k.strip() and v.strip():
+                out[k.strip().lower()] = v.strip()
+    return out
+
+EMAIL_STAGE_MAP = _parse_email_map(os.environ.get(
+    "MILICA_EMAIL_STAGE_MAP", "sales@teksturaburo.com:UC_CYNTHP,custom@teksturaburo.com:UC_O9S4TO"))
+
 
 def _looks_real_phone(raw: str) -> bool:
     """Гард против мусора WEB-источника: настоящий номер = код страны + ≥11 цифр (напр. +381601682333).
@@ -942,6 +960,61 @@ def cleanup_duplicate_leads() -> int:
     return handled
 
 
+def _lead_inbox(lead_id: int) -> str | None:
+    """Ящик-получатель входящего email-лида: SETTINGS.EMAIL_META.__email из bound email-активити (TYPE_ID=4).
+    Совпадение с известным ящиком в EMAIL_STAGE_MAP; предпочитаем входящие (DIRECTION=1). None — не наш/нет."""
+    try:
+        acts = bitrix_call("crm.activity.list", {
+            "filter": {"OWNER_TYPE_ID": 1, "OWNER_ID": int(lead_id), "TYPE_ID": 4},
+            "select": ["ID", "DIRECTION", "SETTINGS"], "order": {"ID": "ASC"}}).get("result", []) or []
+    except Exception as e:
+        log.warning(f"[EMAIL] активити лида {lead_id} не получены: {e}")
+        return None
+    fallback = None
+    for a in acts:
+        s = a.get("SETTINGS")
+        if isinstance(s, str):
+            try:
+                s = json.loads(s)
+            except Exception:
+                s = {}
+        em = (((s or {}).get("EMAIL_META") or {}).get("__email") or "").strip().lower()
+        if em in EMAIL_STAGE_MAP:
+            if str(a.get("DIRECTION")) == "1":          # входящее на наш ящик — точный сигнал
+                return em
+            fallback = fallback or em
+    return fallback
+
+
+def route_email_leads() -> int:
+    """Свежий NEW-лид c SOURCE_ID=EMAIL → стадия-колонка ящика-получателя (sales@→email sales,
+    custom@→email Custom). Только стадия (email не Milica-канал; ответственного/диалог не трогаем).
+    Неизвестный ящик → не трогаем. Идёт ПОСЛЕ возврат-маршрутизации (та уводит возвраты из NEW). Дмитрий 14.06."""
+    if not EMAIL_ROUTING_ENABLED or not EMAIL_STAGE_MAP:
+        return 0
+    since = (datetime.now(BELGRADE_TZ) - timedelta(days=DUP_CLEANUP_MAX_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        leads = bitrix_call("crm.lead.list", {
+            "filter": {"STATUS_ID": "NEW", "SOURCE_ID": "EMAIL", ">DATE_CREATE": since},
+            "select": ["ID", "TITLE"]}).get("result", []) or []
+    except Exception as e:
+        log.error(f"[EMAIL] список NEW email-лидов не получен: {e}")
+        return 0
+    n = 0
+    for ld in leads:
+        inbox = _lead_inbox(ld["ID"])
+        if not inbox:
+            continue                                    # ящик не распознан / не наш → оставляем как есть
+        stage = EMAIL_STAGE_MAP[inbox]
+        try:
+            bitrix_call("crm.lead.update", {"id": ld["ID"], "fields": {"STATUS_ID": stage}})
+            log.info(f"[EMAIL] лид {ld['ID']} → стадия {stage} (получатель {inbox})")
+            n += 1
+        except Exception as e:
+            log.error(f"[EMAIL] лид {ld['ID']}: перевод в {stage} не удался: {e}")
+    return n
+
+
 def process_web_leads() -> int:
     """WEB-лиды (источник «Website», создаются прямо в Bitrix на человеке) → на Milica + Viber-welcome.
     Берём ТОЛЬКО свежие (STATUS=NEW, не старше WEB_LEADS_MAX_AGE_DAYS) и прошедшие гард качества
@@ -1072,6 +1145,14 @@ def run():
             log.info(f"  [RETURN] обработано возвратных лидов: {n_ret}")
     except Exception as e:
         log.error(f"  [RETURN] маршрутизация возвратов упала: {e}")
+
+    # ── ШАГ 1.7: email-лиды (письмо на sales@/custom@) → стадия-колонка ящика ──
+    try:
+        n_mail = route_email_leads()
+        if n_mail:
+            log.info(f"  [EMAIL] распределено email-лидов по стадиям: {n_mail}")
+    except Exception as e:
+        log.error(f"  [EMAIL] распределение email-лидов упало: {e}")
 
     # ── ШАГ 2: обработать новые строки из таблицы ────────────────────────
     total_created   = 0
