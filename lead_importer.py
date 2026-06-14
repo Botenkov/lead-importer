@@ -69,13 +69,31 @@ WEB_LEADS_ENABLED = os.environ.get("MILICA_WEB_LEADS_ENABLED", "true").lower() =
 WEB_LEADS_MAX_AGE_DAYS = int(os.environ.get("MILICA_WEB_LEADS_MAX_AGE_DAYS", "2"))  # старее — не приветствуем
 _WEB_JUNK_NAMES = {"", "lead", "guest", "none", "test", "klijent", "klijenti"}
 
-# Дубль-лиды: Bitrix при возврате известного клиента на НОВЫЙ канал (старая сделка закрыта/другой
-# коннектор) плодит новый лид, хотя у контакта уже есть сделка. Чистим: NEW-лид, у контакта которого
-# есть сделка → статус «Повторный/дубль» (уходит из активной воронки; конверсию ведёт менеджер через
-# CRM_FORWARD). Решение Дмитрия 14.06. 0/false = выкл.
+# Возврат известного клиента: Bitrix при возврате клиента (старая сделка закрыта/новый канал) плодит
+# НОВЫЙ лид, хотя у контакта уже есть сделка. Это НЕ дубль-баг, а повторное обращение. Раньше парковали
+# статусом «Повторный/дубль» — но обращение повисало без хозяина (все новые лиды идут на Milica).
+# Решение Дмитрия 14.06: ВОЗВРАТ ОТДАЁМ ПРОШЛОМУ МЕНЕДЖЕРУ — лид+контакт на ответственного его последней
+# сделки + стадия-колонка этого менеджера + дело «ответить», чтобы ничего не терялось. Milica при этом
+# сама отходит (poller._owned_by_human: у контакта есть сделка человека → не лезет). 0/false = выкл.
 DUP_CLEANUP_ENABLED = os.environ.get("MILICA_DUP_CLEANUP_ENABLED", "true").lower() == "true"
-DUP_LEAD_STATUS = os.environ.get("MILICA_DUP_LEAD_STATUS", "11")        # «Повторный/дубль»
+DUP_LEAD_STATUS = os.environ.get("MILICA_DUP_LEAD_STATUS", "11")        # «Повторный/дубль» (парковка)
 DUP_CLEANUP_MAX_AGE_DAYS = int(os.environ.get("MILICA_DUP_MAX_AGE_DAYS", "3"))
+MILICA_BOT_ID = 2296
+
+def _parse_stage_map(raw: str) -> dict:
+    out = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            if k.strip().isdigit() and v.strip():
+                out[int(k.strip())] = v.strip()
+    return out
+
+RETURN_ROUTING_ENABLED = os.environ.get("MILICA_RETURN_ROUTING_ENABLED", "true").lower() == "true"
+# user_id прошлого менеджера → стадия-колонка лида («sale manager id N»). Дмитрий завёл стадии 14.06.
+RETURN_STAGE_MAP = _parse_stage_map(
+    os.environ.get("MILICA_RETURN_STAGE_MAP", "30:UC_98EDOH,28:UC_WLE3S8"))
 
 
 def _looks_real_phone(raw: str) -> bool:
@@ -849,10 +867,49 @@ def process_kitchen_may_row(
 
 # ─── Главная функция ─────────────────────────────────────────────────────────
 
+def _route_return_lead(ld: dict, cid: int, deals: list) -> str:
+    """Возврат известного клиента → прошлому менеджеру. deals — сделки контакта (с ASSIGNED_BY_ID).
+    «Тот кто общался» = ответственный последней ЧЕЛОВЕЧЕСКОЙ сделки (≠Milica). Действия:
+    есть человек с заведённой стадией → лид+контакт на него + его стадия-колонка + дело «ответить»;
+    человек без стадии → парковка + закрепляем за ним; только Milica/без менеджера → парковка «дубль».
+    Возвращает короткую метку действия для лога."""
+    lead_id = ld["ID"]
+    humans = [d for d in deals if int(d.get("ASSIGNED_BY_ID") or 0) not in (0, MILICA_BOT_ID)]
+    if RETURN_ROUTING_ENABLED and humans:
+        last = max(humans, key=lambda d: int(d.get("ID") or 0))   # последняя сделка человека
+        prior = int(last.get("ASSIGNED_BY_ID") or 0)
+        deal_id = last.get("ID")
+        if prior in RETURN_STAGE_MAP:                  # менеджер с колонкой → полноценная маршрутизация
+            stage = RETURN_STAGE_MAP[prior]
+            bitrix_call("crm.lead.update", {"id": lead_id,
+                        "fields": {"ASSIGNED_BY_ID": prior, "STATUS_ID": stage}})
+            bitrix_call("crm.contact.update", {"id": cid, "fields": {"ASSIGNED_BY_ID": prior}})
+            try:
+                bitrix_call("crm.activity.todo.add", {
+                    "ownerTypeId": 1, "ownerId": int(lead_id), "responsibleId": prior,
+                    "deadline": datetime.now(BELGRADE_TZ).replace(microsecond=0).isoformat(),
+                    "title": "Возврат клиента — ответить в открытой линии",
+                    "description": (f"Известный клиент написал снова (повторное обращение). Прошлая сделка "
+                                    f"#{deal_id}. Ответьте ему в открытой линии — Milica этот диалог не ведёт."),
+                    "pingOffsets": [0]})
+            except Exception as e:
+                log.warning(f"[RETURN] лид {lead_id}: дело не создано: {e}")
+            return f"→ менеджеру {prior} (стадия {stage}, прошлая сделка #{deal_id})"
+        # человек без заведённой стадии-колонки → паркуем, но закрепляем за ним (не теряем владельца)
+        bitrix_call("crm.lead.update", {"id": lead_id,
+                    "fields": {"STATUS_ID": DUP_LEAD_STATUS, "ASSIGNED_BY_ID": prior}})
+        return f"→ «Повторный/дубль» (менеджер {prior} без стадии-колонки, сделка #{deal_id})"
+    # только Milica-сделки / без менеджера → парковка (решение Дмитрия: возврат Milica-сделки не маршрутим)
+    last = max(deals, key=lambda d: int(d.get("ID") or 0))
+    bitrix_call("crm.lead.update", {"id": lead_id, "fields": {"STATUS_ID": DUP_LEAD_STATUS}})
+    return f"→ «Повторный/дубль» (прошлая сделка Milica/без менеджера #{last.get('ID')})"
+
+
 def cleanup_duplicate_leads() -> int:
-    """Дубль-лиды Bitrix: свежий NEW-лид, у контакта которого УЖЕ есть сделка → метим «Повторный/дубль».
-    Так дубль уходит из активной воронки, а сам диалог остаётся у менеджера (CRM_FORWARD). Новый клиент
-    (у контакта сделок нет) и лиды без контакта — не трогаем. Решение Дмитрия 14.06 (кейс Aleksandar)."""
+    """Возврат известного клиента: у контакта свежего NEW-лида УЖЕ есть сделка → НЕ дубль-баг, а повторное
+    обращение. Маршрутизируем прошлому менеджеру (лид+контакт+стадия-колонка+дело), Milica-сделку/без
+    менеджера — паркуем «Повторный/дубль». Milica сама отходит (poller._owned_by_human: у контакта есть
+    сделка человека → не лезет). Новый клиент (сделок нет) и лиды без контакта — не трогаем. Дмитрий 14.06."""
     if not DUP_CLEANUP_ENABLED:
         return 0
     since = (datetime.now(BELGRADE_TZ) - timedelta(days=DUP_CLEANUP_MAX_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -861,28 +918,28 @@ def cleanup_duplicate_leads() -> int:
             "filter": {"STATUS_ID": "NEW", ">DATE_CREATE": since},
             "select": ["ID", "CONTACT_ID", "TITLE"]}).get("result", []) or []
     except Exception as e:
-        log.error(f"[DUP] список NEW-лидов не получен: {e}")
+        log.error(f"[RETURN] список NEW-лидов не получен: {e}")
         return 0
-    marked = 0
+    handled = 0
     for ld in leads:
         cid = ld.get("CONTACT_ID")
         if not cid:
             continue
         try:
             deals = bitrix_call("crm.deal.list", {
-                "filter": {"CONTACT_ID": cid}, "select": ["ID"]}).get("result", []) or []
+                "filter": {"CONTACT_ID": cid}, "select": ["ID", "ASSIGNED_BY_ID"]}).get("result", []) or []
         except Exception as e:
-            log.warning(f"[DUP] сделки контакта {cid} не проверены: {e}")
+            log.warning(f"[RETURN] сделки контакта {cid} не проверены: {e}")
             continue
         if not deals:
-            continue                                   # у контакта нет сделок → не дубль (новый клиент)
+            continue                                   # у контакта нет сделок → новый клиент, не трогаем
         try:
-            bitrix_call("crm.lead.update", {"id": ld["ID"], "fields": {"STATUS_ID": DUP_LEAD_STATUS}})
-            log.info(f"[DUP] лид {ld['ID']} → «Повторный/дубль» (у контакта {cid} есть сделка #{deals[0]['ID']})")
-            marked += 1
+            action = _route_return_lead(ld, cid, deals)
+            log.info(f"[RETURN] лид {ld['ID']} (контакт {cid}) {action}")
+            handled += 1
         except Exception as e:
-            log.error(f"[DUP] лид {ld['ID']}: метка дубля не удалась: {e}")
-    return marked
+            log.error(f"[RETURN] лид {ld['ID']}: маршрутизация не удалась: {e}")
+    return handled
 
 
 def process_web_leads() -> int:
@@ -1008,13 +1065,13 @@ def run():
     except Exception as e:
         log.error(f"  [WEB] обработка WEB-лидов упала: {e}")
 
-    # ── ШАГ 1.6: дубль-лиды (контакт уже имеет сделку) → «Повторный/дубль» ──
+    # ── ШАГ 1.6: возврат известного клиента (у контакта есть сделка) → прошлому менеджеру / парковка ──
     try:
-        n_dup = cleanup_duplicate_leads()
-        if n_dup:
-            log.info(f"  [DUP] помечено дублей: {n_dup}")
+        n_ret = cleanup_duplicate_leads()
+        if n_ret:
+            log.info(f"  [RETURN] обработано возвратных лидов: {n_ret}")
     except Exception as e:
-        log.error(f"  [DUP] чистка дублей упала: {e}")
+        log.error(f"  [RETURN] маршрутизация возвратов упала: {e}")
 
     # ── ШАГ 2: обработать новые строки из таблицы ────────────────────────
     total_created   = 0
