@@ -61,6 +61,23 @@ SOURCE_MAP = {
 }
 
 LEAD_STATUS_ID = "UC_SRP1D8"   # «New sale AI» — лиды ведёт Milica (бот 2296, worker_milica)
+MILICA_ID = 2296
+
+# WEB-лиды (с сайта) создаются прямо в Bitrix на человеке (resp 1). Забираем свежие на Milica + Viber-
+# welcome, как лид-форму (решение Дмитрия 14.06). Источник ШУМНЫЙ (спам/мусор) — гард ниже. 0/false = выкл.
+WEB_LEADS_ENABLED = os.environ.get("MILICA_WEB_LEADS_ENABLED", "true").lower() == "true"
+WEB_LEADS_MAX_AGE_DAYS = int(os.environ.get("MILICA_WEB_LEADS_MAX_AGE_DAYS", "2"))  # старее — не приветствуем
+_WEB_JUNK_NAMES = {"", "lead", "guest", "none", "test", "klijent", "klijenti"}
+
+
+def _looks_real_phone(raw: str) -> bool:
+    """Гард против мусора WEB-источника: настоящий номер = код страны + ≥11 цифр (напр. +381601682333).
+    Локальные/спам-номера вроде 8054002077 (10 цифр, без кода) отсекаются → таким лидом займётся человек."""
+    p = re.sub(r"[ \-()]", "", (raw or "").replace("p:", "").strip())
+    digits = re.sub(r"\D", "", p)
+    if len(digits) < 11:
+        return False
+    return p.startswith("+") or digits.startswith("381") or digits.startswith("00381")
 
 
 # ─── Viber / WazzUp ─────────────────────────────────────────────────────────
@@ -809,6 +826,55 @@ def process_kitchen_may_row(
 
 # ─── Главная функция ─────────────────────────────────────────────────────────
 
+def process_web_leads() -> int:
+    """WEB-лиды (источник «Website», создаются прямо в Bitrix на человеке) → на Milica + Viber-welcome.
+    Берём ТОЛЬКО свежие (STATUS=NEW, не старше WEB_LEADS_MAX_AGE_DAYS) и прошедшие гард качества
+    (валидный телефон с кодом + нормальное имя) — источник шумный (спам/мусор отдаём человеку). После
+    welcome переводим NEW→«New sale AI» + ответственный 2296 (это и дедуп: повторно не возьмём). Только
+    рабочее время Viber (8–20 Белград; ночью пропускаем — утренний tick подхватит). Решение Дмитрия 14.06."""
+    if not WEB_LEADS_ENABLED:
+        return 0
+    if not is_working_hours():
+        log.info("[WEB] нерабочее время (8–20) — WEB-лиды до утра")
+        return 0
+    since = (datetime.now(BELGRADE_TZ) - timedelta(days=WEB_LEADS_MAX_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        leads = bitrix_call("crm.lead.list", {
+            "filter": {"SOURCE_ID": "WEB", "STATUS_ID": "NEW", ">DATE_CREATE": since},
+            "select": ["ID", "NAME", "PHONE", "ASSIGNED_BY_ID"],
+            "order": {"DATE_CREATE": "ASC"}}).get("result", []) or []
+    except Exception as e:
+        log.error(f"[WEB] список WEB-лидов не получен: {e}")
+        return 0
+    if leads:
+        log.info(f"[WEB] свежих WEB-лидов (NEW, ≤{WEB_LEADS_MAX_AGE_DAYS}д): {len(leads)}")
+    sent = 0
+    for ld in leads:
+        lead_id = str(ld["ID"])
+        ph = ld.get("PHONE") or []
+        phone_raw = (ph[0].get("VALUE") if ph and isinstance(ph[0], dict) else "") or ""
+        name, _ = clean_name(ld.get("NAME") or "")
+        if name.lower() in _WEB_JUNK_NAMES or not _looks_real_phone(phone_raw):
+            log.warning(f"[WEB] лид {lead_id} ПРОПУЩЕН гардом (имя='{name}', тел='{phone_raw}') — оставляю человеку")
+            continue
+        phone = phone_raw.lstrip("p:+").replace(" ", "").replace("-", "")
+        # Viber СНАЧАЛА (если упал — лид остаётся NEW, ретрай в след. tick), затем claim+дедуп
+        try:
+            send_viber_wazzup(phone, name, lead_id, product="kitchen")
+        except Exception as e:
+            log.error(f"[WEB] лид {lead_id}: Viber не ушёл ({e}) — оставляю NEW, ретрай позже")
+            continue
+        try:
+            bitrix_call("crm.lead.update", {"id": lead_id, "fields": {
+                "ASSIGNED_BY_ID": MILICA_ID, "STATUS_ID": LEAD_STATUS_ID}})
+        except Exception as e:
+            log.error(f"[WEB] лид {lead_id}: Viber ушёл, но claim не удался ({e}) — возможен повтор")
+        log.info(f"[WEB] лид {lead_id} → Milica + Viber-welcome ({name})")
+        sent += 1
+        time.sleep(random.uniform(30, 45))   # как process_viber_queue (анти-флуд)
+    return sent
+
+
 def run():
     log.info("=" * 60)
     log.info("Запуск импорта лидов")
@@ -874,6 +940,14 @@ def run():
     # Этот блок ищет лиды созданные ночью и шлёт им Viber утром.
     # В нерабочее время молча возвращается без действий.
     process_pending_viber(spreadsheet, tabs)
+
+    # ── ШАГ 1.5: WEB-лиды (источник сайта, прямо в Bitrix) → на Milica + Viber-welcome ──
+    try:
+        n_web = process_web_leads()
+        if n_web:
+            log.info(f"  [WEB] поприветствовано WEB-лидов: {n_web}")
+    except Exception as e:
+        log.error(f"  [WEB] обработка WEB-лидов упала: {e}")
 
     # ── ШАГ 2: обработать новые строки из таблицы ────────────────────────
     total_created   = 0
