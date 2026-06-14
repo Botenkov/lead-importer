@@ -69,6 +69,14 @@ WEB_LEADS_ENABLED = os.environ.get("MILICA_WEB_LEADS_ENABLED", "true").lower() =
 WEB_LEADS_MAX_AGE_DAYS = int(os.environ.get("MILICA_WEB_LEADS_MAX_AGE_DAYS", "2"))  # старее — не приветствуем
 _WEB_JUNK_NAMES = {"", "lead", "guest", "none", "test", "klijent", "klijenti"}
 
+# Дубль-лиды: Bitrix при возврате известного клиента на НОВЫЙ канал (старая сделка закрыта/другой
+# коннектор) плодит новый лид, хотя у контакта уже есть сделка. Чистим: NEW-лид, у контакта которого
+# есть сделка → статус «Повторный/дубль» (уходит из активной воронки; конверсию ведёт менеджер через
+# CRM_FORWARD). Решение Дмитрия 14.06. 0/false = выкл.
+DUP_CLEANUP_ENABLED = os.environ.get("MILICA_DUP_CLEANUP_ENABLED", "true").lower() == "true"
+DUP_LEAD_STATUS = os.environ.get("MILICA_DUP_LEAD_STATUS", "11")        # «Повторный/дубль»
+DUP_CLEANUP_MAX_AGE_DAYS = int(os.environ.get("MILICA_DUP_MAX_AGE_DAYS", "3"))
+
 
 def _looks_real_phone(raw: str) -> bool:
     """Гард против мусора WEB-источника: настоящий номер = код страны + ≥11 цифр (напр. +381601682333).
@@ -826,6 +834,42 @@ def process_kitchen_may_row(
 
 # ─── Главная функция ─────────────────────────────────────────────────────────
 
+def cleanup_duplicate_leads() -> int:
+    """Дубль-лиды Bitrix: свежий NEW-лид, у контакта которого УЖЕ есть сделка → метим «Повторный/дубль».
+    Так дубль уходит из активной воронки, а сам диалог остаётся у менеджера (CRM_FORWARD). Новый клиент
+    (у контакта сделок нет) и лиды без контакта — не трогаем. Решение Дмитрия 14.06 (кейс Aleksandar)."""
+    if not DUP_CLEANUP_ENABLED:
+        return 0
+    since = (datetime.now(BELGRADE_TZ) - timedelta(days=DUP_CLEANUP_MAX_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        leads = bitrix_call("crm.lead.list", {
+            "filter": {"STATUS_ID": "NEW", ">DATE_CREATE": since},
+            "select": ["ID", "CONTACT_ID", "TITLE"]}).get("result", []) or []
+    except Exception as e:
+        log.error(f"[DUP] список NEW-лидов не получен: {e}")
+        return 0
+    marked = 0
+    for ld in leads:
+        cid = ld.get("CONTACT_ID")
+        if not cid:
+            continue
+        try:
+            deals = bitrix_call("crm.deal.list", {
+                "filter": {"CONTACT_ID": cid}, "select": ["ID"]}).get("result", []) or []
+        except Exception as e:
+            log.warning(f"[DUP] сделки контакта {cid} не проверены: {e}")
+            continue
+        if not deals:
+            continue                                   # у контакта нет сделок → не дубль (новый клиент)
+        try:
+            bitrix_call("crm.lead.update", {"id": ld["ID"], "fields": {"STATUS_ID": DUP_LEAD_STATUS}})
+            log.info(f"[DUP] лид {ld['ID']} → «Повторный/дубль» (у контакта {cid} есть сделка #{deals[0]['ID']})")
+            marked += 1
+        except Exception as e:
+            log.error(f"[DUP] лид {ld['ID']}: метка дубля не удалась: {e}")
+    return marked
+
+
 def process_web_leads() -> int:
     """WEB-лиды (источник «Website», создаются прямо в Bitrix на человеке) → на Milica + Viber-welcome.
     Берём ТОЛЬКО свежие (STATUS=NEW, не старше WEB_LEADS_MAX_AGE_DAYS) и прошедшие гард качества
@@ -948,6 +992,14 @@ def run():
             log.info(f"  [WEB] поприветствовано WEB-лидов: {n_web}")
     except Exception as e:
         log.error(f"  [WEB] обработка WEB-лидов упала: {e}")
+
+    # ── ШАГ 1.6: дубль-лиды (контакт уже имеет сделку) → «Повторный/дубль» ──
+    try:
+        n_dup = cleanup_duplicate_leads()
+        if n_dup:
+            log.info(f"  [DUP] помечено дублей: {n_dup}")
+    except Exception as e:
+        log.error(f"  [DUP] чистка дублей упала: {e}")
 
     # ── ШАГ 2: обработать новые строки из таблицы ────────────────────────
     total_created   = 0
