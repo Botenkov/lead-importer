@@ -93,9 +93,11 @@ def _looks_real_phone(raw: str) -> bool:
 WAZZUP_API_KEY          = os.environ.get("WAZZUP_API_KEY", "")
 WAZZUP_VIBER_CHANNEL_ID = "f0911dd4-a6b5-48ad-b39f-f9b47c171277"
 
-# Задержка между сообщениями — случайная, чтобы выглядело по-человечески
-VIBER_DELAY_MIN        = 30   # секунды
-VIBER_DELAY_MAX        = 45
+# Задержка между Viber-сообщениями — случайная: и «по-человечески», и анти-бан Wazzup/Viber.
+# 3–5 мин (решение Дмитрия 14.06): утренний батч ночных лидов в 8:00 нельзя слать пачкой — Viber
+# банит за всплеск. Применяется к ОБОИМ циклам отправки (дневная очередь и утренний разбор pending).
+VIBER_DELAY_MIN        = int(os.getenv("VIBER_DELAY_MIN", "180"))   # секунды (3 мин)
+VIBER_DELAY_MAX        = int(os.getenv("VIBER_DELAY_MAX", "300"))   # секунды (5 мин)
 
 # Часовой пояс Сербии (Railway работает в UTC — без явного TZ будет неверное время)
 BELGRADE_TZ = ZoneInfo("Europe/Belgrade")
@@ -121,14 +123,14 @@ FRIDAY_CUTOFF_HOUR  = 17
 # звонка против нового флоу (упор на переписку, ведёт Milica) + упоминали кухню для шкафных лидов.
 VIBER_TEMPLATES = [
     (
-        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! "
+        "Zdravo, {name}! Ja sam Milica iz TeksturaBuro, hvala vam na upitu! "
         "Sa zadovoljstvom ću vam pomoći oko nameštaja po meri. Treba mi samo par detalja "
         "pa da vam pripremim okvirnu cenu. Mere, fotografije prostora ili primer koji vam se "
         "dopada možete poslati odmah. Predlažem da se dopisujemo ovde, a ako vam je draže "
         "da se čujemo telefonom, tu sam i za to."
     ),
     (
-        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! "
+        "Pozdrav, {name}! Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! "
         "Rado bih vam pomogla da dođemo do okvirne cene — postaviću par pitanja, neće "
         "oduzeti mnogo vremena. Ako imate mere, fotografije prostora ili primer koji vam se "
         "dopada, slobodno pošaljite odmah. Predlažem da se dopisujemo ovde, a ako biste "
@@ -150,16 +152,16 @@ def is_working_hours() -> bool:
 # Тексты валидированы носителем (сербский ресёрч 11.06). Шкафы (Ormari) — на общих VIBER_TEMPLATES.
 WELCOME_KITCHEN = {
     "A": [  # samo_kuhinja — только кухня
-        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Sa zadovoljstvom ću vam pomoći oko kuhinje. Treba mi samo par detalja pa da vam pripremim okvirnu cenu. Predlažem da se dopisujemo ovde, a ako vam je draže da se čujemo telefonom, tu sam i za to.",
-        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Rado bih vam pomogla da dođemo do okvirne cene za vašu kuhinju — postaviću par pitanja, neće oduzeti mnogo vremena. Predlažem da se dopisujemo ovde, a ako biste želeli da se čujemo telefonom, samo recite — biće mi drago.",
+        "Zdravo, {name}! Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Sa zadovoljstvom ću vam pomoći oko kuhinje. Treba mi samo par detalja pa da vam pripremim okvirnu cenu. Predlažem da se dopisujemo ovde, a ako vam je draže da se čujemo telefonom, tu sam i za to.",
+        "Pozdrav, {name}! Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Rado bih vam pomogla da dođemo do okvirne cene za vašu kuhinju — postaviću par pitanja, neće oduzeti mnogo vremena. Predlažem da se dopisujemo ovde, a ako biste želeli da se čujemo telefonom, samo recite — biće mi drago.",
     ],
     "B": [  # kuhinja_+_tehnika — кухня и техника
-        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Rado ću vam pomoći oko kuhinje, a po želji i oko bele tehnike, da sve bude u jednoj ponudi pa da imate potpunu sliku. Treba mi samo par detalja o kuhinji za okvirnu cenu. Što se bele tehnike tiče — mogu da vas posavetujem oko svakog tehničkog pitanja. Predlažem da se dopisujemo ovde, a ako vam je draže telefonom, tu sam i za to.",
-        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Sa zadovoljstvom ću vam pomoći i oko kuhinje i oko bele tehnike — mogu sve da objedinim u jednu ponudu, da odmah imate potpunu cenu. Par detalja o kuhinji — neće oduzeti mnogo vremena, a oko bele tehnike mogu da vas posavetujem oko svakog tehničkog pitanja. Predlažem da se dopisujemo ovde, a ako vam više odgovara da se čujemo, samo recite.",
+        "Zdravo, {name}! Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Rado ću vam pomoći oko kuhinje, a po želji i oko bele tehnike, da sve bude u jednoj ponudi pa da imate potpunu sliku. Treba mi samo par detalja o kuhinji za okvirnu cenu. Što se bele tehnike tiče — mogu da vas posavetujem oko svakog tehničkog pitanja. Predlažem da se dopisujemo ovde, a ako vam je draže telefonom, tu sam i za to.",
+        "Pozdrav, {name}! Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Sa zadovoljstvom ću vam pomoći i oko kuhinje i oko bele tehnike — mogu sve da objedinim u jednu ponudu, da odmah imate potpunu cenu. Par detalja o kuhinji — neće oduzeti mnogo vremena, a oko bele tehnike mogu da vas posavetujem oko svakog tehničkog pitanja. Predlažem da se dopisujemo ovde, a ako vam više odgovara da se čujemo, samo recite.",
     ],
     "C": [  # još_nisam_siguran / пусто / Kitchen New без поля Tehnika
-        "Zdravo, {name}! 🙂 Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Sa zadovoljstvom ću vam pomoći oko kuhinje. Par detalja — pa da vam pripremim okvirnu cenu. Predlažem da se dopisujemo ovde, a ako vam je draže da se čujemo, tu sam i za to.",
-        "Pozdrav, {name}! 🙂 Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Rado bih vam pomogla da dođemo do okvirne cene za kuhinju — postaviću par pitanja, neće oduzeti mnogo vremena. Predlažem da se dopisujemo ovde, a ako biste želeli da se čujemo, samo recite — biće mi drago.",
+        "Zdravo, {name}! Ja sam Milica iz TeksturaBuro, hvala vam na upitu! Sa zadovoljstvom ću vam pomoći oko kuhinje. Par detalja — pa da vam pripremim okvirnu cenu. Predlažem da se dopisujemo ovde, a ako vam je draže da se čujemo, tu sam i za to.",
+        "Pozdrav, {name}! Ja sam Milica iz TeksturaBuro. Hvala vam na interesovanju! Rado bih vam pomogla da dođemo do okvirne cene za kuhinju — postaviću par pitanja, neće oduzeti mnogo vremena. Predlažem da se dopisujemo ovde, a ako biste želeli da se čujemo, samo recite — biće mi drago.",
     ],
 }
 WELCOME_NO_RUSH = "Bez žurbe — pripremiću vam ponudu da bude spremna za trenutak kada vam bude odgovaralo."
@@ -338,6 +340,19 @@ def process_pending_viber(spreadsheet, tabs_cfg: list):
     log.info(f"[VIBER] Найдено {len(pending_queue)} отложенных ночных лидов — отправляем")
 
     for idx, item in enumerate(pending_queue):
+        # АНТИ-ДУБЛЬ при перекрытии прогонов: батч с паузой 3–5 мин может длиться дольше интервала
+        # крона → второй инстанс стартует и берёт ещё не отправленные лиды из своего снимка. Перечитываем
+        # статус строки ПЕРЕД отправкой — если другой прогон уже отправил (CREATED), пропускаем (без
+        # повторного welcome клиенту). Сбой чтения не блокирует отправку (деградируем безопасно).
+        try:
+            cur_status = (item["sheet"].cell(item["sheet_row"], item["status_col"]).value or "").strip()
+        except Exception as e:
+            cur_status = f"VIBER_PENDING:{item['lead_id']}"
+            log.warning(f"[VIBER] не перечитал статус лида {item['lead_id']} ({e}) — отправляю")
+        if not cur_status.startswith("VIBER_PENDING:"):
+            log.info(f"[VIBER] Ночной лид {item['lead_id']} уже обработан ({cur_status}) — "
+                     f"пропускаю (перекрытие прогонов)")
+            continue
         try:
             msg_id = send_viber_wazzup(
                 phone       = item["phone"],
