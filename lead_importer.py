@@ -923,23 +923,19 @@ def _route_return_lead(ld: dict, cid: int, deals: list) -> str:
     return f"→ «Повторный/дубль» (прошлая сделка Milica/без менеджера #{last.get('ID')})"
 
 
-def _lead_session_manager(lead_id) -> int:
-    """ID живого менеджера (из RETURN_STAGE_MAP), который ВЁЛ открытую линию этого лида — по автору
-    активити-сессии IMOPENLINES_SESSION (берём последнюю с человеком-менеджером). Milica-сессии
-    (author 2296) и без человека → 0. Сигнал «менеджер уже общался» для лидов БЕЗ контакта/сделки
-    (кейс 4924: WhatsApp без контакта, 4 сессии вёл Piskun, висел в «Новый лид»). Решение Дмитрия 14.06."""
+def _lead_worked_by_human(lead_id) -> bool:
+    """Открытую линию лида ВЁЛ живой человек (не Milica) — по автору активити IMOPENLINES_SESSION.
+    Сигнал «менеджер уже общался» (vs свежий лид: сессию ведёт Milica/2296 или её ещё нет). КОЛОНКУ
+    выбираем по ОТВЕТСТВЕННОМУ лида (Bitrix-владелец), НЕ по автору сессии: автор бывает чужим
+    (кейс 5430: сессию вёл Piskun 30, но лид Djordje 28 — по автору ушло бы не туда). Дмитрий 14.06."""
     try:
         acts = bitrix_call("crm.activity.list", {
             "filter": {"OWNER_TYPE_ID": 1, "OWNER_ID": int(lead_id), "PROVIDER_ID": "IMOPENLINES_SESSION"},
             "select": ["ID", "AUTHOR_ID"], "order": {"ID": "DESC"}}).get("result", []) or []
     except Exception as e:
         log.warning(f"[RETURN] сессии лида {lead_id} не получены: {e}")
-        return 0
-    for a in acts:
-        au = int(a.get("AUTHOR_ID") or 0)
-        if au in RETURN_STAGE_MAP:
-            return au
-    return 0
+        return False
+    return any(int(a.get("AUTHOR_ID") or 0) not in (0, MILICA_BOT_ID) for a in acts)
 
 
 def _route_lead_to_manager(lead_id, cid, mgr: int) -> str:
@@ -974,7 +970,7 @@ def cleanup_duplicate_leads() -> int:
     try:
         leads = bitrix_call("crm.lead.list", {
             "filter": {"STATUS_ID": "NEW", ">DATE_CREATE": since},
-            "select": ["ID", "CONTACT_ID", "TITLE"]}).get("result", []) or []
+            "select": ["ID", "CONTACT_ID", "TITLE", "ASSIGNED_BY_ID"]}).get("result", []) or []
     except Exception as e:
         log.error(f"[RETURN] список NEW-лидов не получен: {e}")
         return 0
@@ -992,11 +988,11 @@ def cleanup_duplicate_leads() -> int:
                     log.info(f"[RETURN] лид {lead_id} (контакт {cid}) {action}")
                     handled += 1
                     continue
-            # (2) лид без сделки, но открытую линию вёл живой менеджер → его колонка
-            mgr = _lead_session_manager(lead_id)
-            if mgr in RETURN_STAGE_MAP:
-                action = _route_lead_to_manager(lead_id, cid, mgr)
-                log.info(f"[RETURN] лид {lead_id} (сессию вёл менеджер {mgr}) {action}")
+            # (2) лид без сделки, но открытую линию вёл живой менеджер → колонка ОТВЕТСТВЕННОГО менеджера
+            resp = int(ld.get("ASSIGNED_BY_ID") or 0)
+            if resp in RETURN_STAGE_MAP and _lead_worked_by_human(lead_id):
+                action = _route_lead_to_manager(lead_id, cid, resp)
+                log.info(f"[RETURN] лид {lead_id} (вёл живой менеджер, ответственный {resp}) {action}")
                 handled += 1
         except Exception as e:
             log.error(f"[RETURN] лид {lead_id}: маршрутизация не удалась: {e}")
