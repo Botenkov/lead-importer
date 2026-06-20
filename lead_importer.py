@@ -389,6 +389,15 @@ def process_pending_viber(spreadsheet, tabs_cfg: list):
             log.info(f"[VIBER] Ночной лид {item['lead_id']} уже обработан ({cur_status}) — "
                      f"пропускаю (перекрытие прогонов)")
             continue
+        # КЛЕЙМ ДО ОТПРАВКИ (анти-дубль welcome, аудит 20.06 ~33%): пишем CREATED ДО send, чтобы
+        # перекрывающийся прогон, перечитав статус, увидел «не PENDING» и пропустил. Раньше CREATED ставился
+        # ПОСЛЕ send → два прогона успевали оба прочитать PENDING (флип ещё не записан) и оба отправить;
+        # 60-сек crmMessageId-дедуп Wazzup повторы минутами позже НЕ ловит → дубль welcome (кейс Ivana 5×).
+        # Окно гонки сужается с «время отправки» до одного write. Сбой send → откат в VIBER_PENDING (ретрай).
+        try:
+            item["sheet"].update_cell(item["sheet_row"], item["status_col"], f"CREATED:{item['lead_id']}")
+        except Exception as e:
+            log.warning(f"[VIBER] не застолбил статус лида {item['lead_id']} ({e}) — отправляю (деградация)")
         try:
             msg_id = send_viber_wazzup(
                 phone       = item["phone"],
@@ -398,15 +407,13 @@ def process_pending_viber(spreadsheet, tabs_cfg: list):
                 tehnika_raw = item.get("tehnika_raw", ""),
                 timeline    = item.get("timeline", ""),
             )
-            # Успешно — меняем статус с VIBER_PENDING на CREATED
-            item["sheet"].update_cell(
-                item["sheet_row"],
-                item["status_col"],
-                f"CREATED:{item['lead_id']}"
-            )
             log.info(f"[VIBER] ✅ Ночной лид {item['lead_id']} отправлен, msgId={msg_id}")
         except Exception as e:
-            log.warning(f"[VIBER] ❌ Ошибка ночного лида {item['lead_id']}: {e}")
+            log.warning(f"[VIBER] ❌ Ошибка ночного лида {item['lead_id']}: {e} — откат в VIBER_PENDING (ретрай)")
+            try:
+                item["sheet"].update_cell(item["sheet_row"], item["status_col"], f"VIBER_PENDING:{item['lead_id']}")
+            except Exception as e2:
+                log.warning(f"[VIBER] откат статуса лида {item['lead_id']} не удался ({e2})")
 
         if idx < len(pending_queue) - 1:
             delay = random.randint(VIBER_DELAY_MIN, VIBER_DELAY_MAX)
