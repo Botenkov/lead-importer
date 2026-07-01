@@ -1127,7 +1127,7 @@ def run():
     tabs = [
         {
             "name":       "Kitchen New",
-            "range":      "A2:R500",
+            "range":      "A2:R",
             "status_col": 18,   # колонка R (1-based для gspread)
             "processor":  process_kitchen_row,
             "phone_col":  16,   # колонка Q (0-based)
@@ -1137,7 +1137,7 @@ def run():
         },
         {
             "name":       "Ormari",
-            "range":      "A2:S500",
+            "range":      "A2:S",
             "status_col": 19,   # колонка S
             "processor":  process_ormari_row,
             "phone_col":  17,   # колонка R (0-based)
@@ -1147,7 +1147,7 @@ def run():
         },
         {
             "name":       "kitchen Май",
-            "range":      "A2:T500",
+            "range":      "A2:T",
             "status_col": 20,   # колонка T
             "processor":  process_kitchen_may_row,    # tab_label по умолчанию "kitchen Май"
             "phone_col":  18,   # колонка S (0-based)
@@ -1160,7 +1160,7 @@ def run():
             # Структура идентична kitchen Май — переиспользуем тот же processor
             # через functools.partial с другим tab_label для комментария лида.
             "name":       "Kitchen MAY-copy",
-            "range":      "A2:T500",
+            "range":      "A2:T",
             "status_col": 20,   # колонка T (lead_status)
             "processor":  partial(process_kitchen_may_row, tab_label="Kitchen MAY-copy"),
             "phone_col":  18,   # колонка S (0-based) — phone
