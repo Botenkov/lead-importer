@@ -1,0 +1,19 @@
+# секреты и локальное окружение — НИКОГДА в git
+.env
+.env.*
+*.local
+credentials.json
+google_credentials.json
+cookies.txt
+ovde_cookie*.txt
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# логи/временное
+*.log
+.DS_Store

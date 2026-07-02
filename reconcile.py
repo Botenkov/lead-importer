@@ -36,7 +36,7 @@ from google.oauth2.service_account import Credentials
 
 
 # ─── Конфигурация из ENV ────────────────────────────────────────────────────
-BITRIX_WEBHOOK    = os.environ["BITRIX_WEBHOOK"]
+BITRIX_WEBHOOK    = os.environ["BITRIX_WEBHOOK"].rstrip("/") + "/"   # нормализация (консистентно с lead_importer)
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SPREADSHEET_ID    = os.environ.get(
     "SPREADSHEET_ID",
@@ -217,6 +217,19 @@ TABS = [
     },
     {
         "name":            "kitchen Май",
+        "range":           "A2:T",
+        "status_col_idx":  19,   # T (0-based) — статус
+        "email_col_idx":   16,   # Q
+        "phone_col_idx":   18,   # S
+        "date_col_idx":    1,    # B
+    },
+    {
+        # 4-я вкладка импортёра (аудит 02.07): reconcile покрывал 3 из 4 вкладок, а lead_importer.run()
+        # обрабатывает и «Kitchen MAY-copy» (структура идентична «kitchen Май»). Без покрытия фантомный
+        # статус CREATED:NNN на этой вкладке никогда не чистился → при откате/удалении лида в Bitrix строка
+        # навсегда оставалась CREATED:NNN, importer её скипал (is_our_processed_status) → лид не пересоздавался,
+        # клиент терялся без алерта. Вкладка активно наполняется.
+        "name":            "Kitchen MAY-copy",
         "range":           "A2:T",
         "status_col_idx":  19,   # T (0-based) — статус
         "email_col_idx":   16,   # Q

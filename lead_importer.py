@@ -46,10 +46,7 @@ log = logging.getLogger(__name__)
 # ─── Конфигурация ───────────────────────────────────────────────────────────
 
 SPREADSHEET_ID  = "1cOvC_x4jpdArbtPuFnmtXgTk4KiWfpauyw4OIv7UPxA"
-BITRIX_WEBHOOK  = os.environ.get(
-    "BITRIX_WEBHOOK",
-    "https://tekstura.bitrix24.com/rest/1/acrfkolvy6hhyum9/"
-)
+BITRIX_WEBHOOK  = os.environ["BITRIX_WEBHOOK"].rstrip("/") + "/"
 
 # Пауза между запросами к Bitrix24 — чтобы не словить rate limit
 BITRIX_DELAY = 0.4  # секунды
